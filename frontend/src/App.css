@@ -1,0 +1,50 @@
+.home-page {
+  max-width: 640px;
+  margin: 4rem auto;
+  padding: 0 1.5rem;
+  font-family: system-ui, sans-serif;
+  text-align: left;
+}
+
+.home-page h1 {
+  font-size: 2rem;
+  margin-bottom: 0.25rem;
+}
+
+.home-page__subtitle {
+  color: #666;
+  margin-bottom: 2rem;
+}
+
+.status-panel {
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem 1.5rem;
+}
+
+.status-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #eee;
+}
+
+.status-row:last-child {
+  border-bottom: none;
+}
+
+.status-row__label {
+  font-weight: 600;
+}
+
+.status-row[data-status="connected"] .status-row__value {
+  color: #1a7f37;
+}
+
+.status-row[data-status="disconnected"] .status-row__value {
+  color: #cf222e;
+}
+
+.status-row[data-status="checking"] .status-row__value {
+  color: #9a6700;
+}

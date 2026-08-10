@@ -1,0 +1,37 @@
+# Environment
+.env
+.env.local
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+uv.lock.bak
+
+# Node / frontend
+node_modules/
+dist/
+build/
+coverage/
+
+# Editors
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Data (local runtime artifacts, not source)
+data/raw/*
+data/normalized/*
+data/exports/*
+!data/raw/.gitkeep
+!data/normalized/.gitkeep
+!data/exports/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
