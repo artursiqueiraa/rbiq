@@ -121,3 +121,76 @@
 .data-table tr[data-status="COMPLETED"] td:nth-child(4) {
   color: #1a7f37;
 }
+
+.indicator-form {
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.indicator-form__row {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+.indicator-form__row label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: #444;
+}
+
+.indicator-form__row input,
+.indicator-form__row select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.indicator-form__checkboxes {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+  font-size: 0.85rem;
+}
+
+.indicator-form__checkboxes label {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.indicator-form button {
+  padding: 0.5rem 1.25rem;
+  border-radius: 6px;
+  border: none;
+  background: #1a1a1a;
+  color: #fff;
+  cursor: pointer;
+}
+
+.indicator-form button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.indicator-form__error {
+  color: #cf222e;
+}
+
+.line-chart {
+  width: 100%;
+  height: auto;
+  border: 1px solid #eee;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+}
+
+.line-chart__background {
+  fill: #fafafa;
+}

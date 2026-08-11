@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CandleOut(BaseModel):
@@ -68,3 +68,29 @@ class ImportResultOut(BaseModel):
     duplicates: int
     inserted: int
     gaps: int
+
+
+class IndicatorSpecIn(BaseModel):
+    name: str
+    parameters: dict[str, float | int] = Field(default_factory=dict)
+
+
+class IndicatorCalculateRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    start: datetime
+    end: datetime
+    indicators: list[IndicatorSpecIn]
+
+
+class IndicatorSeriesOut(BaseModel):
+    parameters: dict
+    series: dict[str, list[float | None]]
+
+
+class IndicatorCalculateResponse(BaseModel):
+    symbol: str
+    timeframe: str
+    timestamps: list[datetime]
+    close: list[float]
+    indicators: dict[str, IndicatorSeriesOut]

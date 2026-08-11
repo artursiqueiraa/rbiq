@@ -5,12 +5,29 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.data.quality import DataQualityReport, compute_quality_report
-from app.data.types import Candle, Timeframe
+from app.data.types import Candle, DataSource, Timeframe
 from app.database.models import CandleModel
 
 
 def _timeframe_value(timeframe: Timeframe | str) -> str:
     return timeframe.value if isinstance(timeframe, Timeframe) else timeframe
+
+
+def _to_domain_candle(row: CandleModel) -> Candle:
+    """CandleModel (SQLAlchemy row) -> Candle (the plain domain dataclass that
+    the Indicators Engine — and anything built on top of it later — operates
+    on). Keeps ORM types from leaking past the repository boundary."""
+    return Candle(
+        symbol=row.symbol,
+        timeframe=Timeframe(row.timeframe),
+        timestamp=row.timestamp,
+        open=row.open,
+        high=row.high,
+        low=row.low,
+        close=row.close,
+        volume=row.volume,
+        source=DataSource(row.source),
+    )
 
 
 BATCH_SIZE = 5000
@@ -78,6 +95,18 @@ class CandleRepository:
             .order_by(CandleModel.timestamp.asc())
         )
         return list(self.session.execute(stmt).scalars().all())
+
+    def get_domain(
+        self,
+        symbol: str,
+        timeframe: Timeframe | str,
+        start: datetime,
+        end: datetime,
+    ) -> list[Candle]:
+        """Same query as `get`, but returns domain Candle objects instead of ORM
+        rows — this is what the Indicators Engine (and later Strategy/Backtest
+        engines) should call, never `get` directly."""
+        return [_to_domain_candle(row) for row in self.get(symbol, timeframe, start, end)]
 
     def count(self, symbol: str | None = None, timeframe: Timeframe | str | None = None) -> int:
         stmt = select(func.count()).select_from(CandleModel)
