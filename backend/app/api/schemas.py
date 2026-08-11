@@ -156,3 +156,44 @@ class StructureHistoryOut(BaseModel):
     swing_highs: list[SwingPointOut]
     swing_lows: list[SwingPointOut]
     events: list[StructureEventOut]
+
+
+class StrategyEvaluateRequest(BaseModel):
+    strategy: str
+    symbol: str
+    timeframe: str
+    timestamp: datetime
+    parameters: dict = Field(default_factory=dict)
+
+
+class EvaluateAllRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    timestamp: datetime
+
+
+class SignalOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    strategy: str
+    symbol: str
+    timeframe: str
+    timestamp: datetime
+    direction: str
+    strength: str
+    confidence: float
+    expiry_candles: int
+    conditions: list[str]
+    metadata: dict
+
+
+class StrategyEvaluationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    strategy: str
+    signal: SignalOut | None
+    triggered_conditions: list[str]
+    failed_conditions: list[str]
+    evaluated_at: datetime
+    diagnostics: list[str]

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import candles, data, indicators, market, system
+from app.api.routes import candles, data, indicators, market, strategies, system
 from app.core.config import get_settings
 from app.core.logging import configure_logging, logger
 
@@ -38,3 +38,4 @@ app.include_router(candles.router)
 app.include_router(data.router)
 app.include_router(indicators.router)
 app.include_router(market.router)
+app.include_router(strategies.router)
