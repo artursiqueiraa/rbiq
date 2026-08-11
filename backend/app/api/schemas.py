@@ -94,3 +94,65 @@ class IndicatorCalculateResponse(BaseModel):
     timestamps: list[datetime]
     close: list[float]
     indicators: dict[str, IndicatorSeriesOut]
+
+
+class SwingPointOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    type: str
+    timestamp: datetime
+    confirmation_timestamp: datetime
+    price: Decimal
+    index: int
+    strength: float
+
+
+class StructureEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    event_type: str
+    timestamp: datetime
+    confirmation_timestamp: datetime
+    price: Decimal
+    metadata: dict
+
+
+class ZoneOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    kind: str
+    price: Decimal
+    lower_bound: Decimal
+    upper_bound: Decimal
+    touches: int
+    strength: float
+    first_seen: datetime
+    last_seen: datetime
+
+
+class MarketSnapshotOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    symbol: str
+    timeframe: str
+    timestamp: datetime | None
+    direction: str
+    structure_state: str
+    regime: str
+    volatility: str
+    volatility_value: float | None
+    trend_strength: float | None
+    latest_swing_high: SwingPointOut | None
+    latest_swing_low: SwingPointOut | None
+    supports: list[ZoneOut]
+    resistances: list[ZoneOut]
+    structure_events: list[StructureEventOut]
+
+
+class StructureHistoryOut(BaseModel):
+    symbol: str
+    timeframe: str
+    state: str
+    swing_highs: list[SwingPointOut]
+    swing_lows: list[SwingPointOut]
+    events: list[StructureEventOut]
