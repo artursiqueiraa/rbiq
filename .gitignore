@@ -24,11 +24,13 @@ coverage/
 # Logs
 *.log
 
-# Data (local runtime artifacts, not source)
+# Data (local runtime artifacts, not source — but data/raw/test/ is a versioned
+# fixture dataset the Data Engine tests depend on, so it's explicitly kept)
 data/raw/*
 data/normalized/*
 data/exports/*
 !data/raw/.gitkeep
+!data/raw/test/
 !data/normalized/.gitkeep
 !data/exports/.gitkeep
 

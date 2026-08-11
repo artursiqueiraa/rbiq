@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import system
+from app.api.routes import candles, data, system
 from app.core.config import get_settings
 from app.core.logging import configure_logging, logger
 
@@ -34,3 +34,5 @@ app.add_middleware(
 )
 
 app.include_router(system.router)
+app.include_router(candles.router)
+app.include_router(data.router)
