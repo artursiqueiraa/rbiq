@@ -1,18 +1,18 @@
 # SPRINT 1 — Relatório
 ## Infraestrutura Base — IQO Strategy Lab
 
-**Data:** 2026-08-10
-**Status:** Concluída, com uma pendência de verificação (ver seção 10).
+**Data:** 2026-08-10 (infraestrutura) / 2026-08-11 (verificação final pós-reinício)
+**Status:** Concluída. Todos os critérios de aceitação verificados, incluindo PostgreSQL real (seção 10).
 
 ---
 
 ## 1. Resumo
 
-A infraestrutura base do projeto foi criada do zero: backend FastAPI com configuração centralizada, logging estruturado, SQLAlchemy 2.x + Alembic, uma abstração `DataProvider` (sem integração real), frontend React + TypeScript + Vite consumindo a API para mostrar status ao vivo, Docker Compose para PostgreSQL, testes automatizados nos dois lados, `.gitignore`/`.env.example` corretos, README completo e o primeiro commit Git.
+A infraestrutura base do projeto foi criada do zero: backend FastAPI com configuração centralizada, logging estruturado, SQLAlchemy 2.x + Alembic, uma abstração `DataProvider` (sem integração real), frontend React + TypeScript + Vite consumindo a API para mostrar status ao vivo, Docker Compose para PostgreSQL, testes automatizados nos dois lados, `.gitignore`/`.env.example` corretos, README completo e commits Git.
 
 Nenhum item das seções 34 ("não implementar nesta Sprint") foi tocado: sem IQ Option, sem sinais, sem estratégias, sem indicadores, sem backtest, sem paper trading, sem dashboard além da página de status.
 
-**Uma decisão de infraestrutura desta máquina ficou pendente**: o PostgreSQL via Docker não pôde ser validado em execução real (detalhes na seção 10).
+**Atualização de 2026-08-11:** após o usuário reiniciar o Windows (para ativar o WSL2 exigido pelo Docker Desktop) e logar no Docker, a verificação completa foi concluída: `docker compose up -d` subiu o PostgreSQL real (`healthy`), `alembic upgrade head` aplicou a migration inicial contra o banco, e os três endpoints de health (`/health`, `/health/database`, `/health/full`) responderam 200 com o banco de verdade no ar. Backend e frontend também foram subidos lado a lado e o CORS entre eles foi confirmado. Não há mais pendências desta Sprint.
 
 ---
 
@@ -109,9 +109,9 @@ Variáveis via `.env` (`DB_NAME`, `DB_USER`, `DB_PASSWORD`, todas com defaults `
 
 | Método | Rota | Testado | Resultado |
 |---|---|---|---|
-| GET | `/api/system/health` | Sim (pytest) | 200, `{"status":"healthy","service":"iqo-strategy-lab","version":"0.1.0"}` |
-| GET | `/api/system/health/database` | Sim (pytest) | 503 no momento (Postgres não está no ar nesta máquina) — comportamento correto |
-| GET | `/api/system/health/full` | Não coberto por teste dedicado | Implementado, mesma lógica dos dois anteriores combinada |
+| GET | `/api/system/health` | Sim (pytest + curl real) | 200, `{"status":"healthy","service":"iqo-strategy-lab","version":"0.1.0"}` |
+| GET | `/api/system/health/database` | Sim (pytest + curl real, com e sem Postgres no ar) | 503 sem banco / **200 `{"status":"healthy","database":"postgresql"}` com Postgres real rodando** |
+| GET | `/api/system/health/full` | Verificado manualmente via curl contra o servidor real (sem teste pytest dedicado) | 200, `{"status":"healthy","api":"healthy","database":"healthy"}` com Postgres no ar |
 
 ---
 
@@ -153,6 +153,7 @@ Todos os testes criados nesta Sprint passam. Cobertura é intencionalmente míni
 | 1 | `uv` e Docker não estavam instalados na máquina | `uv` instalado via `pip install uv` (autorizado pelo usuário). Docker Desktop instalado via `winget` (autorizado pelo usuário) — ver pendência na seção 10. |
 | 2 | `check_database_connection()` sem timeout de conexão fazia o teste `/health/database` levar ~4min20s para retornar 503 (timeout TCP default do SO ao tentar conectar em uma porta sem serviço) | Adicionado `connect_args={"connect_timeout": 3}` ao engine SQLAlchemy. Tempo do teste caiu de 263s para 7.6s. Isso também evita que o health check trave a API real em produção se o Postgres cair. |
 | 3 | `@app.on_event("startup")` está deprecado no FastAPI atual | Substituído por `lifespan` (context manager), que é o padrão recomendado — evita misturar estilos antigo/novo conforme exigido na seção 14 da Sprint. |
+| 4 | `Settings.model_config.env_file=".env"` era resolvido relativo ao diretório de execução (`backend/`), não à raiz do projeto onde `.env.example`/README instruem criar o `.env`. Rodar `uv run uvicorn` de dentro de `backend/` não encontraria um `.env` na raiz. Descoberto durante a verificação real pós-reinício. | `app/core/config.py` agora resolve `_PROJECT_ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"` — um único `.env` na raiz funciona independente de onde o comando é executado. |
 
 Nenhum outro problema bloqueante.
 
@@ -170,28 +171,31 @@ Nenhum outro problema bloqueante.
 
 ## 10. Pendências
 
-1. **Verificação real de `docker compose up` + `alembic upgrade head` + health check contra Postgres vivo NÃO foi concluída nesta sessão.**
-   - Docker Desktop foi instalado (via `winget install Docker.DockerDesktop`, com autorização do usuário).
-   - O backend WSL2 necessário foi instalado (`wsl --install --no-distribution`), mas **exige reinício do Windows** para ativar — reinício não foi executado (encerraria esta sessão e qualquer outro trabalho aberto do usuário).
-   - **Ação necessária do usuário:** reiniciar o Windows, depois rodar:
-     ```bash
-     docker compose up -d
-     docker compose ps          # esperar "healthy"
-     cd backend
-     uv run alembic upgrade head
-     uv run pytest              # /health/database deve retornar 200
-     ```
-   - Só depois disso o critério "PostgreSQL funcionando" da seção 35 estará 100% verificado ao vivo (hoje está verificado apenas por leitura de código + teste do caminho de falha).
+**Resolvida em 2026-08-11.** O usuário reiniciou o Windows e autenticou no Docker Desktop. Sequência completa executada e verificada nesta máquina:
 
-2. `GET /api/system/health/full` não tem teste automatizado dedicado (só os outros dois endpoints têm). Baixo risco — reaproveita a mesma função `check_database_connection()` já testada.
+```text
+docker compose up -d          → Postgres 16-alpine baixado e iniciado
+docker compose ps             → iqolab-postgres: healthy
+uv run alembic upgrade head   → aplicou 19745c274703_initial contra o banco real
+uv run pytest                 → 5 passed in 1.33s (contra Postgres real)
+uv run uvicorn ...            → GET /health = 200, /health/database = 200 (healthy),
+                                 /health/full = 200
+curl OPTIONS (CORS preflight) → access-control-allow-origin: http://localhost:5173
+npm run dev                   → frontend serve HTTP 200 em http://localhost:5173
+```
 
-Nenhuma outra pendência técnica.
+Todos os processos de verificação (`uvicorn`, `vite`) foram encerrados ao final; nenhum ficou rodando em segundo plano.
+
+Restam apenas dois itens de baixo risco, sem bloquear a conclusão da Sprint:
+
+1. `GET /api/system/health/full` não tem teste `pytest` dedicado (só verificação manual via curl). Reaproveita a mesma função `check_database_connection()` já coberta pelos outros testes.
+2. A renderização do frontend no navegador (React efetivamente mostrando "conectado"/"conectado" na tela) não foi verificada visualmente nesta sessão não-interativa — apenas via teste automatizado (`App.test.tsx`, que mocka o fetch) e via verificação de que o HTML/JS é servido e os endpoints que o hook consome respondem corretamente. Recomenda-se uma checagem visual rápida no navegador antes da Sprint 2.
 
 ---
 
 ## 11. Próxima Sprint
 
-Aguardando autorização explícita para iniciar a **Sprint 2 — Data Engine**, condicionada à resolução da pendência da seção 10 (reinício do Windows + verificação do PostgreSQL ao vivo) — sem isso, o Data Engine não tem onde persistir candles.
+Todos os bloqueadores foram resolvidos. Aguardando autorização explícita do usuário para iniciar a **Sprint 2 — Data Engine**.
 
 ---
 
@@ -211,19 +215,19 @@ Aguardando autorização explícita para iniciar a **Sprint 2 — Data Engine**,
 - [x] CORS configurado (origem única via `settings.frontend_url`, não `*`)
 
 ### Banco
-- [ ] PostgreSQL funcionando **— pendente de reinício do Windows (seção 10)**
+- [x] PostgreSQL funcionando — verificado ao vivo em 2026-08-11 (`docker compose ps` → healthy; `/health/database` → 200)
 - [x] Docker Compose criado e sintaticamente correto
-- [x] healthcheck definido no compose
+- [x] healthcheck definido no compose (confirmado `healthy` na prática)
 - [x] SQLAlchemy configurado (engine, session, timeout de conexão)
-- [x] Alembic configurado e migration inicial gerada
+- [x] Alembic configurado e migration inicial aplicada contra o banco real (`alembic upgrade head`)
 
 ### Frontend
 - [x] React funcionando
 - [x] TypeScript funcionando (build `tsc -b` sem erros)
 - [x] Vite funcionando (`npm run build` e `npm run test` OK)
-- [x] frontend acessando backend (via `systemService` + `useSystemStatus`)
-- [x] status da API exibido
-- [x] status do banco exibido
+- [x] frontend acessando backend (via `systemService` + `useSystemStatus`); CORS confirmado ao vivo entre `localhost:5173` e `localhost:8000`
+- [x] status da API exibido (lógica testada; checagem visual no navegador ainda recomendada — ver seção 10)
+- [x] status do banco exibido (lógica testada; checagem visual no navegador ainda recomendada — ver seção 10)
 
 ### Testes
 - [x] testes backend passando (5/5)

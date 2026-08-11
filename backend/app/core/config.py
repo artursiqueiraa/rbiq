@@ -1,10 +1,16 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# backend/app/core/config.py -> project root is three levels up
+_PROJECT_ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=_PROJECT_ROOT_ENV, env_file_encoding="utf-8", extra="ignore"
+    )
 
     app_name: str = "IQO Strategy Lab"
     app_version: str = "0.1.0"
