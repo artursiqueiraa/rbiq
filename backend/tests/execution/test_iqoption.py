@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -35,6 +36,7 @@ from app.execution import (
     BrokerConnectionError,
     BrokerRejectionError,
     Credentials,
+    ExecutionStatus,
     IQOptionGateway,
     InstrumentType,
     OrderDirection,
@@ -256,3 +258,110 @@ def test_place_order_within_timeout_still_returns_normally():
 
     order_id = gateway.place_order(mk_request(account_type=AccountType.PRACTICE))
     assert order_id == "order-123"
+
+
+class _ResultClient:
+    """Client conectado que também resolve resultados (binário e digital)."""
+
+    def __init__(self):
+        self.check_win_v4_called_with = None
+        self.check_win_digital_v2_called_with = None
+        self.check_win_v4_return = (None, None)
+        self.check_win_digital_v2_return = (False, None)
+
+    def buy(self, *args, **kwargs):
+        return True, "bin-order-1"
+
+    def buy_digital_spot(self, *args, **kwargs):
+        return True, "555111"  # ids digitais são numéricos de verdade (check_win_digital_v2 faz int(order_id))
+
+    def check_win_v4(self, order_id):
+        self.check_win_v4_called_with = order_id
+        return self.check_win_v4_return
+
+    def check_win_digital_v2(self, order_id):
+        self.check_win_digital_v2_called_with = order_id
+        return self.check_win_digital_v2_return
+
+
+def _gateway_with(client, **kwargs):
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"), **kwargs)
+    gateway._client = client
+    gateway._connected_account_type = AccountType.PRACTICE
+    return gateway
+
+
+def test_await_result_routes_digital_orders_to_check_win_digital_v2_not_v4():
+    # Achado real (Sprint 7): binário e digital são resolvidos por métodos
+    # DIFERENTES na lib. Sem rastrear o instrumento por order_id,
+    # await_result sempre chamava check_win_v4 — errado para ordens digitais,
+    # que nunca resolveriam de verdade.
+    client = _ResultClient()
+    client.check_win_digital_v2_return = (True, 5.0)
+    gateway = _gateway_with(client)
+
+    order_id = gateway.place_order(mk_request(instrument=InstrumentType.DIGITAL))
+    result = gateway.await_result(order_id, poll_interval_s=0.01, poll_timeout_s=1.0)
+
+    assert client.check_win_digital_v2_called_with == int(order_id)
+    assert client.check_win_v4_called_with is None
+    assert result.status is ExecutionStatus.WON
+    assert result.profit == 5.0
+
+
+def test_await_result_routes_binary_orders_to_check_win_v4():
+    client = _ResultClient()
+    client.check_win_v4_return = ("win", 8.0)
+    gateway = _gateway_with(client)
+
+    order_id = gateway.place_order(mk_request(instrument=InstrumentType.BINARY))
+    result = gateway.await_result(order_id, poll_interval_s=0.01, poll_timeout_s=1.0)
+
+    assert client.check_win_v4_called_with == order_id
+    assert client.check_win_digital_v2_called_with is None
+    assert result.status is ExecutionStatus.WON
+
+
+@pytest.mark.parametrize(
+    "profit,expected_status",
+    [(5.0, ExecutionStatus.WON), (-5.0, ExecutionStatus.LOST), (0.0, ExecutionStatus.TIE)],
+)
+def test_await_result_digital_infers_status_from_profit_sign(profit, expected_status):
+    # check_win_digital_v2 não devolve um status "win"/"loose"/"equal" como o
+    # binário — só (closed, profit). WON/LOST/TIE precisam ser inferidos.
+    client = _ResultClient()
+    client.check_win_digital_v2_return = (True, profit)
+    gateway = _gateway_with(client)
+
+    order_id = gateway.place_order(mk_request(instrument=InstrumentType.DIGITAL))
+    result = gateway.await_result(order_id, poll_interval_s=0.01, poll_timeout_s=1.0)
+
+    assert result.status is expected_status
+    assert result.profit == profit
+
+
+def test_await_result_digital_check_win_hang_is_retried_not_fatal():
+    # check_win_digital_v2 tem o MESMO busy-wait sem timeout que
+    # buy_digital_spot (achado real). Uma única chamada travada não pode
+    # virar ERROR imediato — o polling deve tratá-la como "ainda não
+    # resolvido" e tentar de novo até poll_timeout_s.
+    client = _ResultClient()
+    calls = {"n": 0}
+    hang_event = threading.Event()
+
+    def flaky_check_win_digital_v2(order_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            hang_event.wait(1.0)  # trava bem além do check_win_call_timeout_s
+            return False, None
+        return True, 3.0
+
+    client.check_win_digital_v2 = flaky_check_win_digital_v2
+    gateway = _gateway_with(client, check_win_call_timeout_s=0.05)
+
+    order_id = gateway.place_order(mk_request(instrument=InstrumentType.DIGITAL))
+    result = gateway.await_result(order_id, poll_interval_s=0.01, poll_timeout_s=2.0)
+
+    assert result.status is ExecutionStatus.WON
+    assert result.profit == 3.0
+    assert calls["n"] >= 2

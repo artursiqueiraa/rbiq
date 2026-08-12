@@ -52,31 +52,45 @@ class IQOptionGateway(BrokerGateway):
         credentials: Credentials,
         practice_by_default: bool = True,
         place_order_timeout_s: float = 15.0,
+        check_win_call_timeout_s: float = 5.0,
     ) -> None:
         self._credentials = credentials
         self._practice_by_default = practice_by_default
         self._place_order_timeout_s = place_order_timeout_s
+        self._check_win_call_timeout_s = check_win_call_timeout_s
         self._client: Any = None
         self._connected_account_type: Optional[AccountType] = None
+        # order_id -> instrument da ordem: `await_result` recebe só o
+        # broker_order_id (contrato de BrokerGateway, seção 6), mas opção
+        # digital e binária são resolvidas por métodos DIFERENTES na lib
+        # (check_win_v4 vs check_win_digital_v2) — sem isto, uma ordem
+        # digital seria consultada com o método errado e nunca resolveria.
+        self._order_instruments: dict[str, InstrumentType] = {}
 
-    def _call_with_timeout(self, fn: Callable[..., Any], *args: Any) -> Any:
+    def _call_with_timeout(self, timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
         """Roda `fn(*args)` numa thread daemon, com timeout próprio.
 
-        Achado real (Sprint 7, validação manual em DEMO): pelo menos um
-        método do fork instalado (`buy_digital_spot`) tem um busy-wait
-        interno SEM timeout, esperando a corretora confirmar o id da ordem —
-        se ela nunca confirmar (ex.: ativo fechado), a chamada trava para
-        sempre, ANTES de `await_result`/`poll_timeout_s` sequer entrarem em
-        jogo. Confirmado na prática: a chamada não retornou em 85s reais.
+        Achado real (Sprint 7, validação manual em DEMO): pelo menos dois
+        métodos do fork instalado (`buy_digital_spot` e `check_win_digital_v2`)
+        têm um busy-wait interno SEM timeout, esperando a corretora
+        confirmar algo — se ela nunca confirmar (ex.: ativo fechado, ou uma
+        falha de callback do websocket), a chamada trava para sempre, ANTES
+        de `poll_timeout_s` sequer entrar em jogo. Confirmado na prática:
+        `buy_digital_spot` não retornou em 85s reais contra a conta do
+        usuário; a leitura do código-fonte de `check_win_digital_v2` mostra
+        o mesmíssimo padrão (`while ...== {}: pass`).
 
         Não existe como matar uma thread Python à força. Se o timeout
         estourar, a thread de origem continua rodando em segundo plano
         (marcada `daemon=True` só para não impedir o processo de encerrar) e
         seu resultado, se algum dia chegar, é descartado — o chamador já
         seguiu em frente tratando isso como `BrokerConnectionError`: o
-        resultado real da ordem fica DESCONHECIDO, não confirmado nem
-        recusado. É uma mitigação, não uma cura — a causa raiz é um bug do
-        fork de terceiros, fora do nosso controle."""
+        resultado real fica DESCONHECIDO, não confirmado nem recusado. É uma
+        mitigação, não uma cura — a causa raiz é um bug do fork de
+        terceiros, fora do nosso controle. Quando usado dentro do polling de
+        `await_result`, uma chamada que estoura esse timeout pode deixar um
+        thread "zumbi" rodando por chamada — aceitável para o caso raro,
+        não para o caminho feliz (onde a chamada retorna rápido)."""
         outcome: dict[str, Any] = {}
 
         def _run() -> None:
@@ -87,13 +101,13 @@ class IQOptionGateway(BrokerGateway):
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
-        thread.join(self._place_order_timeout_s)
+        thread.join(timeout_s)
 
         if thread.is_alive():
             raise BrokerConnectionError(
-                f"Chamada à corretora não respondeu em {self._place_order_timeout_s}s "
-                "(timeout de proteção interno do gateway). O resultado real da ordem é "
-                "DESCONHECIDO — pode ter sido aceita ou não; não assuma nenhum dos dois."
+                f"Chamada à corretora não respondeu em {timeout_s}s "
+                "(timeout de proteção interno do gateway). O resultado real é "
+                "DESCONHECIDO — pode ter sido confirmado ou não; não assuma nenhum dos dois."
             )
         if "error" in outcome:
             raise outcome["error"]
@@ -183,11 +197,13 @@ class IQOptionGateway(BrokerGateway):
             # Envolvida em _call_with_timeout: este método especificamente
             # pode travar sem retornar (ver docstring de _call_with_timeout).
             ok, order_id = self._call_with_timeout(
+                self._place_order_timeout_s,
                 self._client.buy_digital_spot, request.symbol, request.stake, broker_direction, request.expiry_minutes
             )
         else:
             # VERIFICAR: buy(amount, active, action, expirations) -> (bool, order_id)
             ok, order_id = self._call_with_timeout(
+                self._place_order_timeout_s,
                 self._client.buy, request.stake, request.symbol, broker_direction, request.expiry_minutes
             )
 
@@ -196,7 +212,9 @@ class IQOptionGateway(BrokerGateway):
                 f"IQ Option recusou a ordem (retorno bruto: ok={ok!r}, order_id={order_id!r})."
             )
 
-        return str(order_id)
+        order_id_str = str(order_id)
+        self._order_instruments[order_id_str] = request.instrument
+        return order_id_str
 
     def await_result(
         self,
@@ -205,18 +223,25 @@ class IQOptionGateway(BrokerGateway):
         poll_timeout_s: float,
     ) -> ExecutionResult:
         self._require_connected()
+        # Digital e binária são resolvidas por métodos DIFERENTES na lib —
+        # ver o comentário em __init__ sobre _order_instruments. Default
+        # BINARY só é alcançado se place_order() nunca populou o dict (não
+        # deveria acontecer no fluxo normal do LiveExecutor).
+        instrument = self._order_instruments.get(broker_order_id, InstrumentType.BINARY)
         deadline = time.monotonic() + poll_timeout_s
 
         while time.monotonic() < deadline:
             try:
-                # VERIFICAR: check_win_v4(order_id) -> (status: str, profit: float),
-                # onde status costuma ser "win" / "loose" / "equal". Algumas
-                # forks só expõem check_win_v3 (sem estado de empate
-                # separado) — se for o caso da fork instalada, um empate
-                # pode chegar mascarado como profit==0 dentro de "win";
-                # ajuste a leitura de `status_text` abaixo antes de confiar
-                # nisto em conta real.
-                status, profit = self._client.check_win_v4(broker_order_id)
+                if instrument is InstrumentType.DIGITAL:
+                    result = self._poll_digital_result(broker_order_id)
+                else:
+                    result = self._poll_binary_result(broker_order_id)
+            except BrokerConnectionError:
+                # a chamada de checagem em si travou e estourou seu próprio
+                # timeout interno (_call_with_timeout) — trata como "ainda
+                # não resolvido" e tenta de novo até poll_timeout_s.
+                time.sleep(poll_interval_s)
+                continue
             except Exception:
                 # Algumas forks levantam enquanto o resultado ainda está
                 # pendente, em vez de devolver um status "pendente" — trata
@@ -224,30 +249,57 @@ class IQOptionGateway(BrokerGateway):
                 time.sleep(poll_interval_s)
                 continue
 
-            if status is None:
-                time.sleep(poll_interval_s)
-                continue
-
-            status_text = str(status).lower()
-            if status_text in ("win", "won"):
-                return ExecutionResult(
-                    status=ExecutionStatus.WON, profit=float(profit), raw={"status": status, "profit": profit}
-                )
-            if status_text in ("loose", "lose", "lost"):
-                return ExecutionResult(
-                    status=ExecutionStatus.LOST, profit=float(profit), raw={"status": status, "profit": profit}
-                )
-            if status_text in ("equal", "tie", "draw"):
-                return ExecutionResult(
-                    status=ExecutionStatus.TIE, profit=0.0, raw={"status": status, "profit": profit}
-                )
-
+            if result is not None:
+                return result
             time.sleep(poll_interval_s)
 
         return ExecutionResult(
             status=ExecutionStatus.ERROR,
             error=f"Timeout aguardando resolução de {broker_order_id!r} após {poll_timeout_s}s.",
         )
+
+    def _poll_binary_result(self, broker_order_id: str) -> Optional[ExecutionResult]:
+        # VERIFICAR: check_win_v4(order_id) -> (status: str, profit: float),
+        # onde status costuma ser "win" / "loose" / "equal". Algumas forks só
+        # expõem check_win_v3 (sem estado de empate separado) — se for o
+        # caso da fork instalada, um empate pode chegar mascarado como
+        # profit==0 dentro de "win"; ajuste a leitura abaixo antes de
+        # confiar nisto em conta real.
+        status, profit = self._client.check_win_v4(broker_order_id)
+        if status is None:
+            return None
+
+        status_text = str(status).lower()
+        if status_text in ("win", "won"):
+            return ExecutionResult(status=ExecutionStatus.WON, profit=float(profit), raw={"status": status, "profit": profit})
+        if status_text in ("loose", "lose", "lost"):
+            return ExecutionResult(status=ExecutionStatus.LOST, profit=float(profit), raw={"status": status, "profit": profit})
+        if status_text in ("equal", "tie", "draw"):
+            return ExecutionResult(status=ExecutionStatus.TIE, profit=0.0, raw={"status": status, "profit": profit})
+        return None
+
+    def _poll_digital_result(self, broker_order_id: str) -> Optional[ExecutionResult]:
+        # VERIFICAR: check_win_digital_v2(order_id) -> (closed: bool, profit).
+        # Ao contrário do binário, NÃO devolve um status "win"/"loose"/"equal"
+        # explícito — só um profit líquido (stake já excluído, lido do código-
+        # fonte do fork: close_profit - invest, ou pnl_realized). WON/LOST/TIE
+        # são inferidos aqui pelo SINAL desse profit. Envolvida em
+        # _call_with_timeout: tem o mesmo busy-wait sem timeout que
+        # buy_digital_spot (achado real, ver docstring de _call_with_timeout).
+        closed, profit = self._call_with_timeout(
+            self._check_win_call_timeout_s, self._client.check_win_digital_v2, int(broker_order_id)
+        )
+        if not closed or profit is None:
+            return None
+
+        profit = float(profit)
+        if profit > 0:
+            status = ExecutionStatus.WON
+        elif profit < 0:
+            status = ExecutionStatus.LOST
+        else:
+            status = ExecutionStatus.TIE
+        return ExecutionResult(status=status, profit=profit, raw={"closed": closed, "profit": profit})
 
     def _require_connected(self) -> None:
         if self._client is None:

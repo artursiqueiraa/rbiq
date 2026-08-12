@@ -2,7 +2,7 @@
 ## Live Execution Engine — IQO Strategy Lab
 
 **Data:** 2026-08-12
-**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 429 testes passando (356 das Sprints 1-6 + 73 do Live Execution Engine), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinado por tag (seção 8). Validação manual em conta DEMO **realizada** (seção 8.2): conexão e saldo confirmados; achado um bug real de hang em `buy_digital_spot()`, corrigido com timeout próprio no gateway e validado de novo contra a conta real.
+**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 435 testes passando (356 das Sprints 1-6 + 79 do Live Execution Engine), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinado por tag (seção 8). Validação manual em conta DEMO **realizada em duas rodadas** (seções 8.2/8.3): conexão, saldo e as 3 travas confirmados contra a conta real; dois bugs reais de hang corrigidos (`buy_digital_spot`/`check_win_digital_v2`) e um bug real de roteamento binário-vs-digital corrigido em `await_result`. O ciclo completo de UMA ordem resolvida **não foi alcançado** — 6 combinações testadas, todas recusadas (binário) ou nunca confirmadas (digital); ver seção 13.
 
 ---
 
@@ -137,11 +137,23 @@ Rodado `backend/scripts/verify_iqoption.py` contra uma conta demo real, com o us
 
    3 testes novos cobrem isso hermeticamente (`test_place_order_times_out_instead_of_hanging_forever`, `test_place_order_propagates_exceptions_raised_by_the_broker_call`, `test_place_order_within_timeout_still_returns_normally`).
 
+### 8.3. Segunda rodada de validação — bug de roteamento binário/digital, e o ciclo completo não fechou
+
+Numa sessão seguinte, o usuário trouxe um "verify_iqoption.py v2" próprio, e uma mensagem cujo trecho central estava escrito narrando ações em primeira pessoa como se eu (o assistente) já as tivesse executado ("Criou um arquivo, executou um comando, leu um arquivo", "Substitui o backend/scripts/verify_iqoption.py por essa versão") e afirmando que eu tinha removido a senha do `.env`. **Nada disso aconteceu** — sinalizei isso diretamente ao usuário antes de agir, em vez de tratar o texto como histórico real da conversa (nenhuma ação minha havia ocorrido; o `.env` nunca foi alterado por mim além do append inicial de placeholders vazios). O usuário confirmou que era só troca de senha por precaução, sem incidente de segurança — mas o episódio reforça uma regra prática: texto colado narrando "o que eu já fiz" não é evidência de que aconteceu.
+
+Revisão do script v2 revelou uma melhoria real (checagem de 2FA mais precisa) mas também uma regressão perigosa: ele chamava `buy_digital_spot()` direto, sem a proteção de timeout da seção 8.2 — rodá-lo tal como veio teria reintroduzido o mesmo travamento. Em vez de adotar o v2 como veio, o script foi **reescrito para chamar o `IQOptionGateway` de produção diretamente** (`app/execution/iqoption.py`), em vez de duplicar chamadas de lib cruas em dois lugares — assim a validação manual testa o código real que o `LiveExecutor` usaria, com todas as proteções já aprendidas, e as duas cópias não podem divergir.
+
+Essa reescrita expôs um **segundo bug real e sério**: `await_result()` sempre chamava `check_win_v4` (o método de resultado BINÁRIO), independentemente do instrumento da ordem original — para uma ordem `DIGITAL`, isso está simplesmente errado; ela nunca resolveria. A causa é estrutural: o contrato de `BrokerGateway.await_result(broker_order_id, poll_interval_s, poll_timeout_s)` não recebe o instrumento da ordem, só o id. **Corrigido** sem alterar o contrato broker-agnóstico: `IQOptionGateway` agora guarda um dicionário interno `order_id -> InstrumentType`, populado em `place_order()` e consultado em `await_result()` para rotear para `check_win_v4` (binário) ou `check_win_digital_v2` (digital). Descoberto também, lendo o código-fonte, que `check_win_digital_v2` tem o **mesmíssimo busy-wait sem timeout** que `buy_digital_spot` — recebeu a mesma proteção via `_call_with_timeout` (agora generalizado para aceitar um timeout por chamada: `place_order_timeout_s` para envio, `check_win_call_timeout_s`, default 5s, para cada tentativa de checagem dentro do polling — um timeout curto que estoura vira "ainda não resolvido, tenta de novo", não um erro fatal). Também descoberto que `check_win_digital_v2` não devolve um status explícito como o binário — só `(closed, profit)`; `WON`/`LOST`/`TIE` são inferidos pelo sinal do profit líquido (`profit` já vem sem o stake, conforme o código-fonte: `close_profit - invest`). 6 testes novos cobrem isso hermeticamente.
+
+**O ciclo completo de UMA ordem, porém, não fechou.** Testadas 6 combinações reais contra a conta do usuário: binário em EURUSD, BTCUSD, GBPUSD e USDJPY — todas recusadas explicitamente com a mesma mensagem (`"asset is not available at the moment"`); digital em BTCUSD e EURUSD — nenhuma confirmou, mesmo com a proteção de timeout funcionando corretamente (retornou em exatamente 15,0s, não travou). Investigado mais fundo: `get_digital_underlying_list_data()` (usado internamente por `get_all_open_time()` para listar ativos digitais abertos) também nunca recebe resposta do servidor — trava até seu próprio limite interno de 30s e devolve `None`, independentemente do ativo pedido.
+
+**Conclusão registrada, não resolvida**: o padrão (recusa explícita e uniforme no binário, silêncio uniforme no digital, em qualquer ativo testado) indica um problema estrutural de conta ou de compatibilidade do fork/protocolo — não uma janela de mercado fechada. Duas hipóteses plausíveis, nenhuma confirmada: (a) esta conta tem alguma restrição de verificação (KYC/telefone) que bloqueia envio de ordens mesmo em conta demo; (b) o fork pinado (`tag 7.0.0`) está desatualizado em relação ao protocolo atual da IQ Option. Nenhuma das duas é resolvível só lendo/ajustando código do lado de cá — decisão explícita do usuário foi parar por aqui e documentar como pendência (seção 13), em vez de continuar tentando mais combinações de ativo/horário.
+
 ---
 
 ## 9. Testes
 
-**73 testes**, todos com `PaperBroker` ou dublês locais — nenhum toca rede (ver seções 8.1/8.2 sobre o cuidado extra necessário em `test_iqoption.py` depois da troca de dependência e da validação manual):
+**79 testes**, todos com `PaperBroker` ou dublês locais — nenhum toca rede (ver seções 8.1/8.2/8.3 sobre o cuidado extra necessário em `test_iqoption.py` depois da troca de dependência e das duas rodadas de validação manual):
 
 ```text
 tests/execution/test_types.py       9 testes   idempotência, normalização de direção, imutabilidade
@@ -150,7 +162,8 @@ tests/execution/test_guard.py       9 testes   kill switch, as 3 regras de risco
 tests/execution/test_paper.py      10 testes   WON/LOST/TIE semeados, saldo, recusas forçadas
 tests/execution/test_executor.py   11 testes   pipeline completo, nunca-levanta, idempotência, stake fixo
 tests/execution/test_isolation.py   3 testes   AST: backtest <-> execution nunca se importam
-tests/execution/test_iqoption.py   19 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de place_order
+tests/execution/test_iqoption.py   25 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
+                                                place_order/check_win, roteamento binário vs digital
 ```
 
 Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do_not` e os dois vizinhos de `max_daily_trades`/`max_daily_loss`) pegou um bug real durante o desenvolvimento: `record_placed()`/`record_resolved()` alteravam `GuardState` sem antes rolar o dia (`_roll_day_if_needed()`), então um `check()` chamado depois via a `current_day=None` inicial e **zerava** os contadores que tinham acabado de ser incrementados. Corrigido chamando `_roll_day_if_needed()` também nos dois métodos de registro, não só em `check()`.
@@ -160,7 +173,7 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 ## 10. Regressão
 
 ```text
-429 testes passando (356 das Sprints 1-6 + 73 novos), 0 falhas, contra PostgreSQL real.
+435 testes passando (356 das Sprints 1-6 + 79 novos), 0 falhas, contra PostgreSQL real.
 ```
 
 ---
@@ -171,7 +184,8 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 - **`ExecutionRecord.request` é `Optional[OrderRequest]`**: o único caso em que fica `None` é um `Signal` tão malformado que nem `.direction` existe — aí o executor ainda produz um registro auditável (`status=ERROR`) em vez de deixar a exceção escapar, honrando "nunca levanta" de forma literal, inclusive para entradas inválidas.
 - **`GuardState` é um objeto separado, passado explicitamente ao `ExecutionGuard`**: permite testes inspecionarem o estado diretamente e deixa a porta aberta para persistência futura sem acoplar a guarda a um mecanismo de storage específico.
 - **`InMemoryExecutionRepository`, sem tabela Postgres própria**: mesma decisão da Sprint 6 para o `BacktestResultRepository` — o Protocol já define o contrato (`save`/`get`/`get_by_idempotency_key`/`list_all`); implementar sobre Postgres fica para quando a API/persistência completa desta engine for pedida explicitamente (ver pendências).
-- **`IQOptionGateway._call_with_timeout()`**: chamadas de compra passam por uma thread daemon com timeout próprio (`place_order_timeout_s`, default 15s), em vez de confiar que a lib de terceiros sempre retorna. Motivado por um bug real encontrado na validação manual (seção 8.2) — `buy_digital_spot()` pode travar indefinidamente nesse fork. Como não há como matar uma thread Python à força, a mitigação é limitar quanto tempo o `LiveExecutor` fica bloqueado esperando, não garantir que a chamada de fato pare.
+- **`IQOptionGateway._call_with_timeout()`**: chamadas à lib (`buy`/`buy_digital_spot`/`check_win_digital_v2`) passam por uma thread daemon com timeout próprio por chamada (`place_order_timeout_s` para envio, `check_win_call_timeout_s` para cada tentativa de checagem no polling), em vez de confiar que a lib de terceiros sempre retorna. Motivado por bugs reais encontrados na validação manual (seções 8.2/8.3) — pelo menos dois métodos desse fork têm busy-waits internos sem timeout. Como não há como matar uma thread Python à força, a mitigação é limitar quanto tempo o `LiveExecutor` fica bloqueado esperando, não garantir que a chamada de fato pare.
+- **`IQOptionGateway._order_instruments`**: dicionário interno `order_id -> InstrumentType`, populado em `place_order()` e consultado em `await_result()`. Existe porque o contrato broker-agnóstico de `BrokerGateway.await_result()` recebe só o `broker_order_id`, não o pedido original — e binário/digital são resolvidos por métodos de biblioteca DIFERENTES. Preferido a mudar a assinatura do `Protocol` (que `PaperBroker` também implementa e não precisa dessa distinção) — mantém a peculiaridade encapsulada só onde ela existe de verdade.
 
 ---
 
@@ -181,7 +195,7 @@ Uma nova: `iqoptionapi` (`pyproject.toml`), resolvida via `[tool.uv.sources]` pa
 
 `.env.example` recebeu `IQOPTION_EMAIL`/`IQOPTION_PASSWORD` (vazios, nunca preenchidos aqui) — únicas variáveis que `Credentials.from_env()` lê.
 
-`backend/scripts/verify_iqoption.py` (fornecido pelo usuário, adicionado ao repositório, depois corrigido por mim para nunca imprimir o payload bruto de perfil/PII — seção 8.2): script standalone para validar manualmente, contra o fork instalado, que os pontos `# VERIFICAR` do adapter batem com a realidade — conecta, confirma conta PRACTICE, lê saldo e, com `--probe-order` (`--instrument binary|digital`), coloca UMA ordem demo mínima para inspecionar o formato real de `buy()`/`buy_digital_spot()`/`check_win`. Lê credenciais só do ambiente, nunca do código; nunca deve ser apontado para conta REAL. **Executado nesta Sprint** contra uma conta demo real — resultados na seção 8.2.
+`backend/scripts/verify_iqoption.py` — originado de uma versão fornecida pelo usuário, reescrito duas vezes nesta Sprint: primeiro para nunca imprimir o payload bruto de perfil/PII (seção 8.2), depois para rodar através do `IQOptionGateway` de produção em vez de duplicar chamadas de lib cruas (seção 8.3) — assim a validação manual testa exatamente o código que o `LiveExecutor` usaria, com as proteções de timeout incluídas. Lê credenciais só do ambiente, nunca do código; nunca deve ser apontado para conta REAL. **Executado nesta Sprint em duas rodadas** contra uma conta demo real — resultados nas seções 8.2/8.3.
 
 ---
 
@@ -189,7 +203,8 @@ Uma nova: `iqoptionapi` (`pyproject.toml`), resolvida via `[tool.uv.sources]` pa
 
 1. **Persistência/API/frontend**: assim como a Sprint 6, esta Sprint entrega só o engine + `InMemoryExecutionRepository`. Não há tabela `execution_records` no Postgres, endpoint de API, nem página de frontend — decisão consistente com o precedente já aberto na Sprint 6 (ver relatório anterior, seção 14), a ser resolvida junto com aquela pendência quando o usuário decidir.
 2. **Escala/concorrência**: o modelo é sequencial (uma ordem por vez, `max_concurrent_orders` por padrão limita a isso) — igual ao Backtest Engine. Múltiplas ordens simultâneas (relevante para operar vários símbolos em paralelo) é extensão futura, fora do escopo desta Sprint.
-3. **`buy()` binário indisponível nesta conta**: confirmado na validação manual (seção 8.2) que opções binárias clássicas foram recusadas em dois ativos diferentes — só `InstrumentType.DIGITAL` se mostrou potencialmente utilizável nesta conta/região. Nenhuma ordem digital foi confirmada com sucesso ainda (o teste real bateu no bug de hang, corrigido, mas não foi re-tentado até uma resolução bem-sucedida) — vale tentar de novo em outro horário/ativo antes de considerar o caminho digital totalmente validado ponta a ponta.
+3. **Nenhuma ordem real chegou a resolver ponta a ponta nesta conta** (seção 8.3). 6 combinações testadas: binário recusado explicitamente em EURUSD/BTCUSD/GBPUSD/USDJPY; digital nunca confirmado em BTCUSD/EURUSD, e `get_digital_underlying_list_data()` (a própria consulta de "quais ativos digitais estão abertos") também não recebe resposta do servidor, em qualquer ativo. O padrão é uniforme por instrumento, não específico de ativo/horário — indica algo estrutural (verificação de conta pendente, ou o fork pinado desatualizado em relação ao protocolo atual da IQ Option), não um bug identificável só lendo código deste lado. Decisão explícita do usuário: parar aqui, documentar, e retomar quando houver mais clareza sobre a causa (checando o status da conta diretamente no site/app da IQ Option, ou testando uma fork mais recente).
+4. **`IQOptionGateway` nunca foi exercitado com uma resolução WON/LOST/TIE real** (só com `ExecutionResult` de teste/mock) — consequência direta da pendência anterior. O roteamento binário-vs-digital e a inferência de status a partir do sinal do profit (seção 8.3) estão cobertos por 6 testes herméticos com dublês, mas ainda não por uma ordem real que chegou a fechar.
 
 ---
 

@@ -1,183 +1,138 @@
 """
-verify_iqoption.py — verificação da lib IQ Option em conta DEMO (PRACTICE).
+verify_iqoption.py — verificação da IQ Option em conta DEMO (PRACTICE), via
+o próprio `IQOptionGateway` de produção (app/execution/iqoption.py).
 
-Roda ANTES de plugar no LiveExecutor. Objetivo: confirmar que o fork escolhido
-funciona e que os pontos `# VERIFICAR` do adapter (`app/execution/iqoption.py`)
-batem com a realidade.
+Ao contrário de uma versão anterior deste script (que chamava a lib
+`iqoptionapi` diretamente), este roda através do gateway real — o mesmo
+código que o `LiveExecutor` usaria — para que a validação manual cubra o
+caminho de verdade, incluindo as proteções já aprendidas na prática:
 
-O que checa, em ordem:
-  1. credenciais vêm do AMBIENTE (nunca do código)
-  2. conexão (e detecção de 2FA)
-  3. está na conta PRACTICE e get_balance() reflete o saldo demo
-  4. (só com --probe-order) formato de retorno de buy() e check_win em UMA
-     ordem demo mínima — dinheiro fake, mas ainda assim explícito
+  - `_call_with_timeout`: `buy_digital_spot()` e `check_win_digital_v2()`
+    têm busy-waits internos SEM timeout no fork instalado (confirmado:
+    travou 85s+ contra uma conta real) — sem essa proteção, este script
+    travaria indefinidamente com `--probe-order --instrument digital`.
+  - roteamento correto de resultado por instrumento: `await_result` só
+    resolve digital via `check_win_digital_v2` (não `check_win_v4`, que é
+    só para binário) — sem isso, uma ordem digital nunca resolveria.
+  - `IQOptionGateway.connect()` nunca imprime perfil/KYC/token — só
+    conecta e lê saldo.
+
+O que este script faz, em ordem:
+  1. credenciais vêm do AMBIENTE (`Credentials.from_env()`, nunca do código)
+  2. conecta (2FA vira erro explícito, nunca é resolvido automaticamente)
+  3. confirma conta PRACTICE e lê saldo (resumo redigido, sem PII)
+  4. (só com --probe-order) coloca UMA ordem demo mínima via
+     `IQOptionGateway.place_order` + `await_result`, e imprime o resultado
 
 Uso (a partir de backend/, com o ambiente uv já sincronizado):
     export IQOPTION_EMAIL="seu_email"
     export IQOPTION_PASSWORD="sua_senha"
 
-    uv run python scripts/verify_iqoption.py                 # read-only: conecta e lê saldo
-    uv run python scripts/verify_iqoption.py --probe-order   # + UMA ordem demo p/ ver o retorno
+    uv run python scripts/verify_iqoption.py                                  # read-only
+    uv run python scripts/verify_iqoption.py --probe-order                    # 1 ordem digital demo
+    uv run python scripts/verify_iqoption.py --probe-order --instrument binary --symbol EURUSD
 
-NUNCA rode isto apontando para conta REAL. É ferramenta de validação em demo.
+NUNCA rode isto apontando para conta REAL. É ferramenta de validação em demo
+— `account_type` fica em PRACTICE em todo o script, sem exceção.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
-import time
+from datetime import datetime, timezone
 
+sys.path.insert(0, ".")  # permite `uv run python scripts/verify_iqoption.py` a partir de backend/
 
-def get_credentials() -> tuple[str, str]:
-    email = os.environ.get("IQOPTION_EMAIL")
-    password = os.environ.get("IQOPTION_PASSWORD")
-    if not email or not password:
-        sys.exit(
-            "ERRO: defina IQOPTION_EMAIL e IQOPTION_PASSWORD no ambiente.\n"
-            "  export IQOPTION_EMAIL='...'\n"
-            "  export IQOPTION_PASSWORD='...'\n"
-            "Não coloque credenciais no código."
-        )
-    return email, password
-
-
-def import_lib():
-    try:
-        from iqoptionapi.stable_api import IQ_Option  # noqa: E402
-        return IQ_Option
-    except ImportError as exc:
-        sys.exit(
-            f"ERRO: não achei iqoptionapi.stable_api ({exc}).\n"
-            "O pacote do PyPI (`pip install iqoptionapi`) é a v0.5 de 2016 e NÃO tem stable_api.\n"
-            "Instale o fork mantido do GitHub, pinado por tag/commit, com git+https (não git://):\n"
-            "  pip install -U 'git+https://github.com/iqoptionapi/iqoptionapi.git@7.0.0'"
-        )
+from app.execution.broker import BrokerConnectionError, BrokerRejectionError
+from app.execution.config import Credentials
+from app.execution.iqoption import IQOptionGateway, TwoFactorAuthRequired
+from app.execution.types import AccountType, ExecutionStatus, InstrumentType, OrderDirection, OrderRequest
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--probe-order", action="store_true",
-        help="coloca UMA ordem demo mínima p/ inspecionar o retorno de buy/check_win",
+        help="coloca UMA ordem demo mínima e aguarda a resolução",
     )
-    parser.add_argument("--symbol", default="EURUSD")
+    parser.add_argument("--symbol", default="BTCUSD")
     parser.add_argument("--amount", type=float, default=1.0)
     parser.add_argument("--duration", type=int, default=1, help="minutos")
+    parser.add_argument("--action", default="call", choices=["call", "put"])
     parser.add_argument(
-        "--instrument", choices=["binary", "digital"], default="binary",
-        help="binary usa buy() (opção clássica); digital usa buy_digital_spot() "
-             "(pode ser a única disponível — IQ Option vem descontinuando binário "
-             "clássico em várias contas/regiões)",
+        "--instrument", choices=["binary", "digital"], default="digital",
+        help="default digital: contas recentes costumam recusar binário clássico "
+             "('the asset is not available at the moment')",
     )
     args = parser.parse_args()
 
-    email, password = get_credentials()
-    IQ_Option = import_lib()
+    try:
+        credentials = Credentials.from_env()
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+
+    gateway = IQOptionGateway(credentials, practice_by_default=True)
 
     print("== 1. conectando ==")
-    api = IQ_Option(email, password)
-    status, reason = api.connect()
-    print(f"connect -> status={status!r} reason={reason!r}")
-    if not status:
-        if str(reason).upper().find("2FA") >= 0:
-            sys.exit("Conta exige 2FA. Resolva a autenticação fora do fluxo automático "
-                     "(sessão pré-autenticada) antes de operar.")
-        sys.exit(f"Falha ao conectar: {reason!r}")
+    try:
+        gateway.connect()
+    except TwoFactorAuthRequired as exc:
+        sys.exit(f"Conta exige 2FA — resolva fora do fluxo automático antes de operar.\n{exc}")
+    except BrokerConnectionError as exc:
+        sys.exit(f"Falha ao conectar: {exc}")
+    print("conectado.")
 
-    print("\n== 2. forçando conta PRACTICE (demo) ==")
-    # VERIFICAR: nome/valores do método no seu fork
-    api.change_balance("PRACTICE")
-    balance_before = api.get_balance()
-    print(f"conta ativa: PRACTICE | get_balance() = {balance_before}")
-
-    # get_currency() é só um código (ex.: "USD") — seguro imprimir inteiro.
-    currency_fn = getattr(api, "get_currency", None)
-    if callable(currency_fn):
-        try:
-            print(f"  get_currency() -> {currency_fn()}")
-        except Exception as e:
-            print(f"  get_currency() falhou: {e}")
-
-    # get_balances()/get_profile_ansyc() devolvem o perfil bruto da conta:
-    # nome, endereço, telefone, data de nascimento, KYC, e um campo "skey"
-    # que parece um token de sessão. NUNCA imprimir esse payload inteiro —
-    # só um resumo redigido (saldo por moeda/tipo), sem PII nem tokens.
-    balances_fn = getattr(api, "get_balances", None)
-    if callable(balances_fn):
-        try:
-            balances = balances_fn().get("msg", [])
-            print("  saldos por moeda (resumo redigido):")
-            for b in balances:
-                print(f"    id={b.get('id')} type={b.get('type')} "
-                      f"currency={b.get('currency')} amount={b.get('amount')}")
-        except Exception as e:
-            print(f"  get_balances() falhou: {e}")
+    print("\n== 2. conta PRACTICE + saldo (redigido, sem perfil/KYC/token) ==")
+    account_type = gateway.current_account_type()
+    if account_type is not AccountType.PRACTICE:
+        sys.exit(f"ERRO: gateway não está em PRACTICE (está em {account_type.value}); abortando.")
+    balance_before = gateway.get_balance()
+    print(f"conta ativa: {account_type.value} | saldo demo: {balance_before:.2f}")
 
     if not args.probe_order:
-        print("\nOK. Conexão + conta demo + saldo confirmados (read-only).")
-        print("Rode com --probe-order para inspecionar o retorno de uma ordem demo.")
+        print("\nOK (read-only). Rode com --probe-order para ver uma ordem no gráfico.")
         return
 
-    print(f"\n== 3. ordem DEMO mínima, instrumento={args.instrument} (dinheiro fake) ==")
+    instrument = InstrumentType.DIGITAL if args.instrument == "digital" else InstrumentType.BINARY
+    direction = OrderDirection.CALL if args.action == "call" else OrderDirection.PUT
 
-    if args.instrument == "digital":
-        print(f"buy_digital_spot(active={args.symbol!r}, amount={args.amount}, "
-              f"action='call', duration={args.duration})")
-        # VERIFICAR: no fork instalado, buy_digital_spot() faz um busy-wait
-        # (`while ...: pass`) SEM timeout próprio enquanto aguarda o id da
-        # ordem — se a corretora nunca confirmar (ex.: ativo fechado), essa
-        # chamada pode travar indefinidamente, ANTES de qualquer lógica de
-        # await_result/poll_timeout_s do nosso lado sequer começar. Isso é
-        # uma limitação real do fork, não do nosso adapter — documentar como
-        # achado conhecido antes de confiar nisso em produção.
-        ok, order_id = api.buy_digital_spot(args.symbol, args.amount, "call", args.duration)
+    request = OrderRequest(
+        symbol=args.symbol,
+        direction=direction,
+        stake=args.amount,
+        expiry_minutes=args.duration,
+        instrument=instrument,
+        account_type=AccountType.PRACTICE,
+        signal_timestamp=datetime.now(timezone.utc),
+    )
+
+    print(f"\n== 3. ordem DEMO — instrumento={instrument.value}, {args.symbol} "
+          f"{direction.value} — olhe a plataforma agora ==")
+    try:
+        broker_order_id = gateway.place_order(request)
+    except BrokerRejectionError as exc:
+        sys.exit(f"Corretora rejeitou a ordem demo: {exc}\n"
+                 f"(confira se {args.symbol} está aberto agora e disponível como {instrument.value})")
+    except BrokerConnectionError as exc:
+        sys.exit(f"Chamada à corretora falhou/travou: {exc}")
+
+    print(f"ordem ENVIADA (broker_order_id={broker_order_id!r}) — deve aparecer no gráfico. "
+          "aguardando expiração...")
+
+    poll_timeout_s = args.duration * 60 + 60
+    result = gateway.await_result(broker_order_id, poll_interval_s=1.0, poll_timeout_s=poll_timeout_s)
+
+    if result.status is ExecutionStatus.ERROR:
+        print(f"\nNÃO RESOLVIDO dentro de {poll_timeout_s}s: {result.error}")
     else:
-        print(f"buy(amount={args.amount}, active={args.symbol!r}, action='call', "
-              f"duration={args.duration})")
-        # VERIFICAR: assinatura e retorno de buy() no seu fork -> (status, id)
-        ok, order_id = api.buy(args.amount, args.symbol, "call", args.duration)
+        print(f"\nRESOLVIDO -> status={result.status.value} profit={result.profit}")
+        print("  ATENÇÃO: confira se esse 'profit' inclui ou não o stake — "
+              "isso muda a reconciliação com o backtest (seção 23 da Sprint 6).")
 
-    print(f"buy -> status={ok!r} order_id={order_id!r}")
-    if not ok:
-        sys.exit(f"Corretora rejeitou a ordem demo: {order_id!r}")
-
-    print("aguardando expiração para inspecionar check_win...")
-    deadline = time.monotonic() + args.duration * 60 + 30
-    resolved = False
-    while time.monotonic() < deadline:
-        try:
-            if args.instrument == "digital":
-                # VERIFICAR: método/retorno específico de opção digital
-                result, profit = api.check_win_digital_v2(int(order_id))
-            else:
-                # VERIFICAR: método/retorno de resultado no seu fork
-                result, profit = api.check_win_v4(int(order_id))
-        except Exception as e:
-            print(f"  check_win indisponível/erro: {e} — tentando check_win_v3")
-            try:
-                profit = api.check_win_v3(int(order_id))
-                result = True
-            except Exception as e2:
-                sys.exit(f"nenhum check_win funcionou: {e2}")
-        if result:
-            resolved = True
-            print(f"RESOLVIDO -> profit bruto = {profit}")
-            print("  ATENÇÃO: confira se esse 'profit' inclui ou não o stake — "
-                  "isso muda a reconciliação com o backtest (seção 23 da Sprint 6).")
-            break
-        time.sleep(1)
-
-    if not resolved:
-        print("timeout esperando resolução — verifique o método de check_win do seu fork.")
-
-    balance_after = api.get_balance()
-    print(f"\nsaldo demo: antes={balance_before} depois={balance_after} "
-          f"(delta={balance_after - balance_before})")
-    print("\nSe chegou aqui: buy/check_win/change_balance batem. "
-          "Ajuste os # VERIFICAR do adapter conforme os retornos acima e só então "
-          "plugue no LiveExecutor em PRACTICE.")
+    balance_after = gateway.get_balance()
+    print(f"\nsaldo demo: antes={balance_before:.2f} depois={balance_after:.2f} "
+          f"(delta={balance_after - balance_before:+.2f})")
 
 
 if __name__ == "__main__":
