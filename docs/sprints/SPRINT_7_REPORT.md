@@ -2,7 +2,7 @@
 ## Live Execution Engine — IQO Strategy Lab
 
 **Data:** 2026-08-12
-**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 439 testes passando (356 das Sprints 1-6 + 83 do Live Execution Engine), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em quatro rodadas** (seções 8.2-8.5), com **êxito**: uma ordem BINARY real (`USDCAD-OTC`) foi enviada, resolvida (`WON`, profit 0.82) e refletida corretamente no saldo — através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez. Cinco bugs reais corrigidos ao longo da validação: hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`, dicionário de ativos operáveis nunca atualizado em `connect()` (causa raiz das recusas anteriores), e `check_win_v4` chamado com o tipo de chave errado (string em vez de int), fazendo o polling travar silenciosamente sem nunca resolver. Caminho `DIGITAL` continua sem confirmar (problema separado, não resolvido — ver seção 13); caminho `BINARY` está validado e funcional.
+**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 452 testes passando (356 das Sprints 1-6 + 87 do Live Execution Engine + 9 do novo `app/live`), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em quatro rodadas** (seções 8.2-8.5), com **êxito**: uma ordem BINARY real (`USDCAD-OTC`) foi enviada, resolvida (`WON`, profit 0.82) e refletida corretamente no saldo — através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez. Cinco bugs reais corrigidos ao longo da validação: hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`, dicionário de ativos operáveis nunca atualizado em `connect()` (causa raiz das recusas anteriores), e `check_win_v4` chamado com o tipo de chave errado (string em vez de int), fazendo o polling travar silenciosamente sem nunca resolver. Caminho `DIGITAL` continua sem confirmar (problema separado, não resolvido — ver seção 13); caminho `BINARY` está validado e funcional. Além do escopo original da spec: um loop de trading ao vivo (`app/live`, seção 8.6) foi construído sob pedido explícito do usuário — testado hermeticamente, ainda não iniciado contra a conta real em modo contínuo.
 
 ---
 
@@ -180,11 +180,25 @@ Nenhuma das duas hipóteses da seção 8.4 (restrição de conta, fork desatuali
 
 Digital continua não confirmando (seção 8.3/8.4) mesmo com sufixo `-OTC` — problema separado, não investigado a fundo por já haver um caminho binário funcional e validado para seguir adiante.
 
+### 8.6. Componente novo: `app/live` — o loop de trading ao vivo
+
+Com `IQOptionGateway` provado ponta a ponta, o usuário pediu explicitamente para construir o que faltava: um processo que decide entradas sozinho (via Strategy Engine, Sprint 5) e as executa, em vez de só validar uma ordem manualmente. **Isto não faz parte da especificação original da Sprint 7** (que termina em `iqoption.py` + validação manual) — é um componente novo, autorizado nesta sessão.
+
+Arquitetura, decidida para não violar a isolação já estabelecida entre `app.backtest` e `app.execution` (nenhum dos dois importa o outro): criado um TERCEIRO pacote, `backend/app/live/`, que fica ACIMA dos dois — pode depender de `app.strategies`/`app.market`/`app.indicators` (para gerar sinais) e de `app.execution` (para executá-los) sem que nenhuma dessas isolações seja tocada.
+
+- **`app/live/loop.py` (`LiveTradingLoop`)**: por iteração, busca os candles mais recentes (`CandleSource` Protocol — `IQOptionGateway.get_recent_candles` já satisfaz isso), só reavalia a estratégia quando aparece um candle genuinamente novo (nunca reavalia o mesmo candle em formação repetidamente), monta `MarketSnapshot`/indicadores/`StrategyContext` com a MESMA lógica de `app/backtest/adapters.py::StrategyEvaluatorAdapter` — reimplementada aqui (não importada de `app.backtest`) para não criar um terceiro ponto de acoplamento entre os dois pacotes isolados — e, se a estratégia sinalizar, chama `LiveExecutor.execute(signal, symbol)` diretamente (nenhum adapter necessário: `Signal` real já bate com o que o executor espera por duck typing). `run_forever()` nunca deixa uma falha numa iteração matar o loop — mesmo princípio "nunca levanta" do `LiveExecutor`, um nível acima.
+- **`IQOptionGateway.get_recent_candles(symbol, timeframe, count)`**: capacidade nova do gateway (fora do `BrokerGateway` Protocol — `PaperBroker` não tem candles reais para servir), converte o retorno de `client.get_candles()` para o `Candle` canônico do Data Engine (`app.data.types.Candle`, com `DataSource.IQ_OPTION`). VERIFICAR: campos `from`/`to`/`open`/`close`/`min`(=low)/`max`(=high)/`volume` confirmados na fork instalada via uma chamada real. Mesmo achado de `check_win_v4`/`check_win_digital_v2`: `get_candles` também não tem timeout próprio na lib — protegida por `_call_with_timeout`.
+- **`backend/scripts/run_live_bot.py`**: CLI interativo. Credenciais (email + senha via `getpass`, nunca ecoada) e as paridades a operar são digitadas quando o script abre — nunca lidas de `.env`, por pedido explícito do usuário. Sempre PRACTICE (não existe caminho neste script para ligar REAL — decisão deliberada, dado que este código é novo e ainda não passou pelo mesmo nível de escrutínio do resto da engine). Pede confirmação explícita (`s/N`) antes de iniciar o loop. Ctrl+C encerra de forma limpa. Múltiplos símbolos são operados em round-robin sequencial (uma `LiveTradingLoop` por símbolo, um `LiveExecutor`/`ExecutionGuard`/`InMemoryExecutionRepository` compartilhados) — sem threads, mais simples e mais fácil de auditar.
+
+Isolamento verificado por AST (`tests/live/test_isolation.py`), mesmo padrão de `tests/execution/test_isolation.py`: `app.live` nunca importa `app.backtest`, e `app.backtest` nunca importa `app.live` — a reimplementação da lógica de avaliação (em vez de importar de `app.backtest`) não é só uma intenção de design, é uma regra testada.
+
+**Não executado de ponta a ponta em modo contínuo real ainda** — construído e testado hermeticamente (`tests/live/test_loop.py`, `PaperBroker`), mas iniciar de fato o loop infinito contra a conta real é uma ação com escopo diferente de "validar uma ordem" (fica mandando ordens sozinho, sem supervisão a cada ciclo) e não foi autorizada explicitamente ainda nesta sessão.
+
 ---
 
 ## 9. Testes
 
-**83 testes**, todos com `PaperBroker` ou dublês locais — nenhum toca rede (ver seções 8.1-8.5 sobre o cuidado extra necessário em `test_iqoption.py` ao longo das quatro rodadas de validação manual):
+**96 testes** (87 em `tests/execution/` + 9 em `tests/live/`), todos com `PaperBroker` e dublês locais — nenhum toca rede (ver seções 8.1-8.6 sobre o cuidado extra necessário em `test_iqoption.py` ao longo das quatro rodadas de validação manual):
 
 ```text
 tests/execution/test_types.py       9 testes   idempotência, normalização de direção, imutabilidade
@@ -193,9 +207,12 @@ tests/execution/test_guard.py       9 testes   kill switch, as 3 regras de risco
 tests/execution/test_paper.py      10 testes   WON/LOST/TIE semeados, saldo, recusas forçadas
 tests/execution/test_executor.py   11 testes   pipeline completo, nunca-levanta, idempotência, stake fixo
 tests/execution/test_isolation.py   3 testes   AST: backtest <-> execution nunca se importam
-tests/execution/test_iqoption.py   29 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
-                                                place_order/check_win, roteamento binário vs digital,
-                                                refresh de ativos no connect()
+tests/execution/test_iqoption.py   33 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
+                                                place_order/check_win/get_candles, roteamento binário vs digital,
+                                                refresh de ativos no connect(), conversão para Candle canônico
+tests/live/test_loop.py             7 testes   causalidade (só reavalia em candle novo), execução quando sinaliza,
+                                                nunca reavalia o mesmo candle, run_forever sobrevive a exceções
+tests/live/test_isolation.py        2 testes   AST: app.live <-> app.backtest nunca se importam
 ```
 
 Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do_not` e os dois vizinhos de `max_daily_trades`/`max_daily_loss`) pegou um bug real durante o desenvolvimento: `record_placed()`/`record_resolved()` alteravam `GuardState` sem antes rolar o dia (`_roll_day_if_needed()`), então um `check()` chamado depois via a `current_day=None` inicial e **zerava** os contadores que tinham acabado de ser incrementados. Corrigido chamando `_roll_day_if_needed()` também nos dois métodos de registro, não só em `check()`.
@@ -205,7 +222,7 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 ## 10. Regressão
 
 ```text
-439 testes passando (356 das Sprints 1-6 + 83 novos), 0 falhas, contra PostgreSQL real.
+452 testes passando (356 das Sprints 1-6 + 87 de execution + 9 de live), 0 falhas, contra PostgreSQL real.
 ```
 
 ---
@@ -236,10 +253,10 @@ Uma nova: `iqoptionapi` (`pyproject.toml`), resolvida via `[tool.uv.sources]` pa
 1. **Persistência/API/frontend**: assim como a Sprint 6, esta Sprint entrega só o engine + `InMemoryExecutionRepository`. Não há tabela `execution_records` no Postgres, endpoint de API, nem página de frontend — decisão consistente com o precedente já aberto na Sprint 6 (ver relatório anterior, seção 14), a ser resolvida junto com aquela pendência quando o usuário decidir.
 2. **Escala/concorrência**: o modelo é sequencial (uma ordem por vez, `max_concurrent_orders` por padrão limita a isso) — igual ao Backtest Engine. Múltiplas ordens simultâneas (relevante para operar vários símbolos em paralelo) é extensão futura, fora do escopo desta Sprint.
 3. **Instrumento `DIGITAL` continua sem confirmar** (seções 8.3-8.5): mesmo com o sufixo `-OTC` correto e as duas causas-raiz do binário já corrigidas, `buy_digital_spot`/`check_win_digital_v2`/`get_digital_underlying_list_data` nunca recebem resposta do servidor para este usuário. Não investigado a fundo depois que o caminho `BINARY` se mostrou funcional — não é urgente enquanto `BINARY` cobrir os pares que o usuário quer operar, mas seria necessário revisitar se ele precisar especificamente de opções digitais.
-4. **Loop de trading contínuo (orquestrador ao vivo)**: pedido explicitamente pelo usuário nesta sessão. Estava pausado enquanto o `place_order` não tinha fechado nenhum ciclo real — agora que fechou (seção 8.5), a pausa não se justifica mais tecnicamente, mas o componente em si ainda não foi construído nem autorizado a começar. Não faz parte do escopo original da especificação da Sprint 7 (que termina em `iqoption.py` + validação manual de uma ordem) — seria, na prática, o início de uma Sprint 8, e depende de decisões de design ainda não discutidas (como as paridades/estratégias são escolhidas, como credenciais são fornecidas — o usuário mencionou preferir informá-las interativamente ao iniciar o processo, não via `.env`).
+4. **Loop de trading contínuo construído, mas não iniciado contra a conta real** (`app/live`, seção 8.6): `LiveTradingLoop` + `scripts/run_live_bot.py` estão prontos e testados hermeticamente com `PaperBroker`. Falta a etapa final — o usuário rodar `uv run python scripts/run_live_bot.py`, digitar credenciais/paridades/estratégia, e confirmar o início — que ainda não aconteceu nesta sessão. Esse componente inteiro (tipos novos, `app/live`, o CLI) não passou pelo mesmo nível de revisão/tempo de maturação que o resto da engine (que atravessou 4 rodadas de validação manual antes de ser considerada confiável) — vale tratar a primeira execução real como mais uma rodada de validação, não como "pronto para produção".
 
 ---
 
 ## 14. Próxima Sprint
 
-O caminho de execução BINARY está validado ponta a ponta contra a conta real do usuário. Aguardando decisão explícita sobre o loop de trading contínuo (pendência 4) — que componente exatamente construir (loop autônomo guiado por estratégia vs. ferramenta onde o usuário escolhe o par manualmente, como as credenciais são fornecidas) antes de começar, conforme convenção do projeto.
+O caminho de execução BINARY está validado ponta a ponta contra a conta real do usuário, e o loop de trading ao vivo (`app/live`) está construído e testado hermeticamente. Falta a etapa final: o usuário rodar `scripts/run_live_bot.py` de fato contra a conta real e confirmar que as entradas aparecem corretamente na plataforma. Nenhum trabalho adicional além disso será iniciado sem autorização explícita, conforme convenção do projeto.

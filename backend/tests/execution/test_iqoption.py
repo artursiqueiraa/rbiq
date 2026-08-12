@@ -31,6 +31,7 @@ from pathlib import Path
 
 import pytest
 
+from app.data.types import Timeframe
 from app.execution import (
     AccountType,
     BrokerConnectionError,
@@ -429,3 +430,60 @@ def test_await_result_digital_check_win_hang_is_retried_not_fatal():
     assert result.status is ExecutionStatus.WON
     assert result.profit == 3.0
     assert calls["n"] >= 2
+
+
+class _CandleClient:
+    """Client conectado que também serve candles (app.live.loop.CandleSource)."""
+
+    def __init__(self, raw_candles):
+        self.raw_candles = raw_candles
+        self.get_candles_called_with = None
+
+    def get_candles(self, active, interval, count, endtime):
+        self.get_candles_called_with = (active, interval, count)
+        return self.raw_candles
+
+
+def test_get_recent_candles_converts_to_domain_shape_and_sorts_by_time():
+    raw = [
+        {"from": 1_700_000_120, "to": 1_700_000_180, "open": 1.2, "close": 1.25, "min": 1.15, "max": 1.30, "volume": 0},
+        {"from": 1_700_000_060, "to": 1_700_000_120, "open": 1.1, "close": 1.2, "min": 1.05, "max": 1.22, "volume": 0},
+    ]
+    client = _CandleClient(raw)
+    gateway = _gateway_with(client)
+
+    candles = gateway.get_recent_candles("EURUSD-OTC", Timeframe.M1, 2)
+
+    assert client.get_candles_called_with[0] == "EURUSD-OTC"
+    assert client.get_candles_called_with[1] == 60  # M1 -> 60s
+    assert len(candles) == 2
+    assert candles[0].timestamp < candles[1].timestamp  # ordenado, mesmo vindo fora de ordem
+    assert candles[0].symbol == "EURUSD-OTC"
+    assert candles[0].timeframe is Timeframe.M1
+    assert str(candles[0].open) == "1.1"
+    assert str(candles[0].high) == "1.22"
+    assert str(candles[0].low) == "1.05"
+    assert str(candles[0].close) == "1.2"
+
+
+def test_get_recent_candles_returns_empty_list_when_broker_has_nothing():
+    client = _CandleClient([])
+    gateway = _gateway_with(client)
+    assert gateway.get_recent_candles("EURUSD-OTC", Timeframe.M1, 10) == []
+
+
+def test_get_recent_candles_before_connect_raises():
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"))
+    with pytest.raises(BrokerConnectionError):
+        gateway.get_recent_candles("EURUSD-OTC", Timeframe.M1, 10)
+
+
+def test_get_recent_candles_times_out_instead_of_hanging_forever():
+    class _HangingCandleClient:
+        def get_candles(self, *args, **kwargs):
+            time.sleep(10.0)
+            return []
+
+    gateway = _gateway_with(_HangingCandleClient(), check_win_call_timeout_s=0.05)
+    with pytest.raises(BrokerConnectionError, match="não respondeu"):
+        gateway.get_recent_candles("EURUSD-OTC", Timeframe.M1, 10)

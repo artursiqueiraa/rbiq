@@ -34,7 +34,11 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Callable, Optional
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any, Callable, Optional, Sequence
+
+from app.data.types import Candle, DataSource, Timeframe
 
 from .broker import BrokerConnectionError, BrokerGateway, BrokerRejectionError
 from .config import Credentials
@@ -197,6 +201,52 @@ class IQOptionGateway(BrokerGateway):
         # VERIFICAR: get_balance() -> float, saldo da conta ATIVA (a que foi
         # selecionada pelo último change_balance()).
         return float(self._client.get_balance())
+
+    def get_recent_candles(self, symbol: str, timeframe: Timeframe, count: int) -> Sequence[Candle]:
+        """Candles recentes de verdade, no shape canônico do Data Engine
+        (`app.data.types.Candle`) — usado pelo loop de trading ao vivo
+        (`app.live`) para alimentar o Strategy Engine sem depender de dados
+        históricos importados via CSV (Sprint 2).
+
+        Não faz parte do `BrokerGateway` (PaperBroker não tem candles reais
+        para servir) — é uma capacidade extra específica deste gateway.
+
+        VERIFICAR: `get_candles(active, interval_segundos, count, endtime)`
+        devolve uma lista de dicts com `from`/`to`/`open`/`close`/`min`/`max`
+        (min=low, max=high) — confirmado na fork instalada, mas o nome dos
+        campos é exatamente o tipo de coisa que varia entre forks. Como
+        `check_win_v4`, este método também não tem timeout próprio na fork
+        instalada — protegido por `_call_with_timeout`.
+        """
+        self._require_connected()
+        interval_seconds = int(timeframe.duration.total_seconds())
+        raw_candles = self._call_with_timeout(
+            self._check_win_call_timeout_s,
+            self._client.get_candles,
+            symbol,
+            interval_seconds,
+            count,
+            time.time(),
+        )
+        if not raw_candles:
+            return []
+
+        candles = [
+            Candle(
+                symbol=symbol,
+                timeframe=timeframe,
+                timestamp=datetime.fromtimestamp(raw["from"], tz=timezone.utc),
+                open=Decimal(str(raw["open"])),
+                high=Decimal(str(raw["max"])),
+                low=Decimal(str(raw["min"])),
+                close=Decimal(str(raw["close"])),
+                source=DataSource.IQ_OPTION,
+                volume=Decimal(str(raw["volume"])) if raw.get("volume") is not None else None,
+            )
+            for raw in raw_candles
+        ]
+        candles.sort(key=lambda c: c.timestamp)  # a lib não garante ordem
+        return candles
 
     def place_order(self, request: OrderRequest) -> str:
         self._require_connected()
