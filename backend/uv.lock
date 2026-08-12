@@ -346,7 +346,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.14" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "iqoptionapi", git = "https://github.com/iqoptionapi/iqoptionapi.git?tag=7.0.0" },
+    { name = "iqoptionapi", git = "https://github.com/iqoptionapi/iqoptionapi.git?tag=7.1.1" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.9" },
@@ -363,8 +363,8 @@ dev = [
 
 [[package]]
 name = "iqoptionapi"
-version = "7.0.0"
-source = { git = "https://github.com/iqoptionapi/iqoptionapi.git?tag=7.0.0#7dce9067aa58227de23322fdb7acdde28c6bc924" }
+version = "7.1.1"
+source = { git = "https://github.com/iqoptionapi/iqoptionapi.git?tag=7.1.1#8a903cc094a74af1ed935a56a2d6b5a9ed3319d7" }
 dependencies = [
     { name = "pylint" },
     { name = "requests" },
