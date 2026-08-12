@@ -2,7 +2,7 @@
 ## Live Execution Engine — IQO Strategy Lab
 
 **Data:** 2026-08-12
-**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 435 testes passando (356 das Sprints 1-6 + 79 do Live Execution Engine), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em três rodadas** (seções 8.2/8.3/8.4): conexão, saldo e as 3 travas confirmados contra a conta real; três bugs reais corrigidos (hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`). O ciclo completo de UMA ordem resolvida **não foi alcançado** — 10 combinações testadas em 2 versões da lib, todas recusadas (binário) ou nunca confirmadas (digital), com padrão idêntico nas duas versões — indício de restrição de conta, não de código; ver seção 13. Construção do loop de trading contínuo **pausada a pedido do usuário** até isso ser esclarecido.
+**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 439 testes passando (356 das Sprints 1-6 + 83 do Live Execution Engine), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em quatro rodadas** (seções 8.2-8.5), com **êxito**: uma ordem BINARY real (`USDCAD-OTC`) foi enviada, resolvida (`WON`, profit 0.82) e refletida corretamente no saldo — através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez. Cinco bugs reais corrigidos ao longo da validação: hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`, dicionário de ativos operáveis nunca atualizado em `connect()` (causa raiz das recusas anteriores), e `check_win_v4` chamado com o tipo de chave errado (string em vez de int), fazendo o polling travar silenciosamente sem nunca resolver. Caminho `DIGITAL` continua sem confirmar (problema separado, não resolvido — ver seção 13); caminho `BINARY` está validado e funcional.
 
 ---
 
@@ -157,13 +157,34 @@ Pesquisado então (`WebSearch` + GitHub API) se havia uma fork mais atualizada q
 
 **Resultado com a fork atualizada: idêntico.** `EURGBP`/`AUDCAD` binário recusados com a mesma mensagem exata do servidor; `EURUSD` digital travou até o mesmo timeout de 15s de novo. Duas versões de biblioteca diferentes (uma delas ativa e recém-corrigida especificamente para validação de ativo) produzindo o MESMO resultado byte-a-byte descarta a hipótese de bug/desatualização da lib — a mensagem de recusa vem do servidor (`self.api.buy_multi_option[req_id]["message"]`, não um erro de cliente), então isto é o servidor da IQ Option recusando/ignorando o pedido de forma consistente, independente de qual biblioteca cliente está sendo usada.
 
-**Conclusão atualizada, ainda não resolvida**: a hipótese (a) da seção 8.3 (restrição de verificação de conta — KYC/telefone pendentes, observados no perfil da seção 8.2) agora é a mais provável, com a hipótese (b) (fork desatualizada) efetivamente descartada. Isso só é verificável pelo usuário diretamente no site/app da IQ Option (fora do alcance deste código) — decisão explícita: pausar antes de construir qualquer loop de trading contínuo sobre um caminho de execução que ainda não fechou nem uma vez, e retestar assim que a conta for confirmada. A fork `7.1.1` foi mantida (é estritamente melhor: mais recente, mantida, timeout próprio em `buy()`) mesmo sem ter resolvido isto.
+**Conclusão da seção 8.4 (superada pela 8.5 abaixo, mantida aqui por fidelidade histórica)**: a hipótese (a) da seção 8.3 (restrição de verificação de conta) parecia a mais provável, com a hipótese (b) (fork desatualizada) efetivamente descartada. Como a seção seguinte mostra, **nenhuma das duas hipóteses estava certa** — nem conta, nem versão da lib. Era símbolo e um bug nosso.
+
+### 8.5. Quarta rodada — causa raiz real encontrada e corrigida: ciclo completo funcionando
+
+O usuário pediu para pesquisar em fóruns/GitHub e insistir até funcionar. `WebSearch` + a API do GitHub acharam duas issues antigas no repositório da lib com a mesma mensagem exata de erro — e a resposta de um mantenedor/usuário resolvia tudo: **o par precisa do sufixo `-OTC`** (ex.: `EURUSD-OTC`, não `EURUSD`) para a maioria dos ativos. Testado `EURUSD-OTC`: erro mudou de `"asset is not available"` para `"active is suspended"` — diferente, mais específico, prova de que o símbolo agora era reconhecido.
+
+Investigando por que `USDCAD-OTC` (confirmado aberto e não suspenso via `get_all_init_v2()`, junto com mais 437 ativos) ainda dava `KeyError` ao ser passado para `buy()`, a causa raiz real apareceu lendo o código-fonte de `stable_api.py`: `buy()` procura o símbolo num dicionário LOCAL (`iqoptionapi.constants.ACTIVES`) que vem **pré-populado só parcialmente** — os pares "-OTC" (a maioria do que está de fato operável) simplesmente não estão lá até uma chamada explícita (`client.get_ALL_Binary_ACTIVES_OPCODE()`) atualizar esse dicionário a partir do servidor. Nosso `IQOptionGateway.connect()` nunca fazia essa chamada. Corrigido: `connect()` agora chama esse refresh (protegido por `_call_with_timeout`, com fallback silencioso se o método não existir na fork instalada) logo após `change_balance()`. Confirmado com uma chamada `buy()` real: `(True, 14159642063)` — **a primeira ordem aceita de verdade em toda a validação manual desta Sprint**.
+
+Aguardando a resolução dessa ordem apareceu um **segundo bug real, nosso**: `_poll_binary_result` passava `broker_order_id` como STRING para `check_win_v4`, mas a implementação da fork indexa seu dicionário interno de resultados (`self.api.socket_option_closed[id_number]`) por chave INTEIRA — o lookup com string falha silenciosamente (a exceção é engolida por um `except: pass` dentro da própria lib) e o busy-wait interno, que não tem NENHUM timeout próprio (confirmado lendo o código-fonte: `while True: try: ... except: pass`), nunca sai. Diferente do caminho digital (que já fazia `int(broker_order_id)` desde a seção 8.3), o caminho binário nunca tinha essa conversão. Corrigido: `int(broker_order_id)` antes de `check_win_v4`, e a chamada agora passa por `_call_with_timeout` também (mesmo padrão do digital) — defesa em profundidade, já que a lib não tem timeout próprio aqui.
+
+**Resultado, através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez**:
+
+```text
+== 3. ordem DEMO — instrumento=BINARY, USDCAD-OTC CALL ==
+ordem ENVIADA (broker_order_id='14159684792')
+RESOLVIDO -> status=WON profit=0.8200000000000001
+saldo demo: antes=9134.78 depois=9135.60 (delta=+0.82)
+```
+
+Nenhuma das duas hipóteses da seção 8.4 (restrição de conta, fork desatualizada) era a causa. A causa real era mais simples e mais chata: **símbolo sem o sufixo certo, e dois bugs nossos de dados (dicionário de ativos não atualizado, tipo de chave errado num lookup)** — nenhum dos dois visível nos testes herméticos com dublês, porque os dublês nunca simulavam esse comportamento específico da lib real. Fica registrado como lição: testes herméticos provam que a ORQUESTRAÇÃO está certa (guarda, idempotência, nunca-levanta), mas só uma validação manual contra a conta real prova que a INTEGRAÇÃO com uma lib de terceiros de fato funciona — os dois são necessários, nenhum substitui o outro.
+
+Digital continua não confirmando (seção 8.3/8.4) mesmo com sufixo `-OTC` — problema separado, não investigado a fundo por já haver um caminho binário funcional e validado para seguir adiante.
 
 ---
 
 ## 9. Testes
 
-**79 testes**, todos com `PaperBroker` ou dublês locais — nenhum toca rede (ver seções 8.1/8.2/8.3 sobre o cuidado extra necessário em `test_iqoption.py` depois da troca de dependência e das duas rodadas de validação manual):
+**83 testes**, todos com `PaperBroker` ou dublês locais — nenhum toca rede (ver seções 8.1-8.5 sobre o cuidado extra necessário em `test_iqoption.py` ao longo das quatro rodadas de validação manual):
 
 ```text
 tests/execution/test_types.py       9 testes   idempotência, normalização de direção, imutabilidade
@@ -172,8 +193,9 @@ tests/execution/test_guard.py       9 testes   kill switch, as 3 regras de risco
 tests/execution/test_paper.py      10 testes   WON/LOST/TIE semeados, saldo, recusas forçadas
 tests/execution/test_executor.py   11 testes   pipeline completo, nunca-levanta, idempotência, stake fixo
 tests/execution/test_isolation.py   3 testes   AST: backtest <-> execution nunca se importam
-tests/execution/test_iqoption.py   25 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
-                                                place_order/check_win, roteamento binário vs digital
+tests/execution/test_iqoption.py   29 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
+                                                place_order/check_win, roteamento binário vs digital,
+                                                refresh de ativos no connect()
 ```
 
 Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do_not` e os dois vizinhos de `max_daily_trades`/`max_daily_loss`) pegou um bug real durante o desenvolvimento: `record_placed()`/`record_resolved()` alteravam `GuardState` sem antes rolar o dia (`_roll_day_if_needed()`), então um `check()` chamado depois via a `current_day=None` inicial e **zerava** os contadores que tinham acabado de ser incrementados. Corrigido chamando `_roll_day_if_needed()` também nos dois métodos de registro, não só em `check()`.
@@ -183,7 +205,7 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 ## 10. Regressão
 
 ```text
-435 testes passando (356 das Sprints 1-6 + 79 novos), 0 falhas, contra PostgreSQL real.
+439 testes passando (356 das Sprints 1-6 + 83 novos), 0 falhas, contra PostgreSQL real.
 ```
 
 ---
@@ -213,12 +235,11 @@ Uma nova: `iqoptionapi` (`pyproject.toml`), resolvida via `[tool.uv.sources]` pa
 
 1. **Persistência/API/frontend**: assim como a Sprint 6, esta Sprint entrega só o engine + `InMemoryExecutionRepository`. Não há tabela `execution_records` no Postgres, endpoint de API, nem página de frontend — decisão consistente com o precedente já aberto na Sprint 6 (ver relatório anterior, seção 14), a ser resolvida junto com aquela pendência quando o usuário decidir.
 2. **Escala/concorrência**: o modelo é sequencial (uma ordem por vez, `max_concurrent_orders` por padrão limita a isso) — igual ao Backtest Engine. Múltiplas ordens simultâneas (relevante para operar vários símbolos em paralelo) é extensão futura, fora do escopo desta Sprint.
-3. **Nenhuma ordem real chegou a resolver ponta a ponta nesta conta** (seções 8.3/8.4). 10 combinações testadas em 2 versões da lib (`7.0.0` e `7.1.1`): binário recusado explicitamente em EURUSD/BTCUSD/GBPUSD/USDJPY/AUDCAD/EURGBP — inclusive em pares que o usuário confirmou visualmente abertos na plataforma; digital nunca confirmado em BTCUSD/EURUSD; `get_digital_underlying_list_data()` (a própria consulta de "quais ativos digitais estão abertos") também nunca recebe resposta do servidor. O padrão é idêntico nas duas versões da lib, o que descarta "fork desatualizada" como causa — sobra a hipótese de restrição de verificação de conta (KYC/telefone pendentes, observados no perfil da seção 8.2), só verificável pelo usuário diretamente no site/app da IQ Option, fora do alcance deste código.
-4. **`IQOptionGateway` nunca foi exercitado com uma resolução WON/LOST/TIE real** (só com `ExecutionResult` de teste/mock) — consequência direta da pendência anterior. O roteamento binário-vs-digital e a inferência de status a partir do sinal do profit (seção 8.3) estão cobertos por 6 testes herméticos com dublês, mas ainda não por uma ordem real que chegou a fechar.
-5. **Loop de trading contínuo (orquestrador ao vivo)**: pedido explicitamente pelo usuário nesta sessão, mas **pausado a pedido dele mesmo** depois do achado da seção 8.4 — construir um loop automático sobre um `place_order` que nunca fechou um ciclo real produziria código não-verificável. Retomar depois que a pendência 3 for esclarecida. Esse componente não faz parte do escopo original da especificação da Sprint 7 (que termina em `iqoption.py` + validação manual de uma ordem) — seria, na prática, o início de uma Sprint 8.
+3. **Instrumento `DIGITAL` continua sem confirmar** (seções 8.3-8.5): mesmo com o sufixo `-OTC` correto e as duas causas-raiz do binário já corrigidas, `buy_digital_spot`/`check_win_digital_v2`/`get_digital_underlying_list_data` nunca recebem resposta do servidor para este usuário. Não investigado a fundo depois que o caminho `BINARY` se mostrou funcional — não é urgente enquanto `BINARY` cobrir os pares que o usuário quer operar, mas seria necessário revisitar se ele precisar especificamente de opções digitais.
+4. **Loop de trading contínuo (orquestrador ao vivo)**: pedido explicitamente pelo usuário nesta sessão. Estava pausado enquanto o `place_order` não tinha fechado nenhum ciclo real — agora que fechou (seção 8.5), a pausa não se justifica mais tecnicamente, mas o componente em si ainda não foi construído nem autorizado a começar. Não faz parte do escopo original da especificação da Sprint 7 (que termina em `iqoption.py` + validação manual de uma ordem) — seria, na prática, o início de uma Sprint 8, e depende de decisões de design ainda não discutidas (como as paridades/estratégias são escolhidas, como credenciais são fornecidas — o usuário mencionou preferir informá-las interativamente ao iniciar o processo, não via `.env`).
 
 ---
 
 ## 14. Próxima Sprint
 
-Aguardando autorização explícita do usuário, conforme convenção do projeto. Nenhum trabalho adicional será iniciado até então — incluindo o loop de trading contínuo (pendência 5), que só deve ser retomado depois que o usuário confirmar o status da conta na IQ Option.
+O caminho de execução BINARY está validado ponta a ponta contra a conta real do usuário. Aguardando decisão explícita sobre o loop de trading contínuo (pendência 4) — que componente exatamente construir (loop autônomo guiado por estratégia vs. ferramenta onde o usuário escolhe o par manualmente, como as credenciais são fornecidas) antes de começar, conforme convenção do projeto.

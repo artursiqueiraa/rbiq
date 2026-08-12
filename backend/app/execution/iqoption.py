@@ -53,11 +53,13 @@ class IQOptionGateway(BrokerGateway):
         practice_by_default: bool = True,
         place_order_timeout_s: float = 15.0,
         check_win_call_timeout_s: float = 5.0,
+        refresh_actives_timeout_s: float = 20.0,
     ) -> None:
         self._credentials = credentials
         self._practice_by_default = practice_by_default
         self._place_order_timeout_s = place_order_timeout_s
         self._check_win_call_timeout_s = check_win_call_timeout_s
+        self._refresh_actives_timeout_s = refresh_actives_timeout_s
         self._client: Any = None
         self._connected_account_type: Optional[AccountType] = None
         # order_id -> instrument da ordem: `await_result` recebe só o
@@ -160,6 +162,27 @@ class IQOptionGateway(BrokerGateway):
         # algumas forks, "practice"/"real" minúsculo em outras.
         target_mode = "PRACTICE" if self._practice_by_default else "REAL"
         client.change_balance(target_mode)
+
+        # ACHADO REAL (validação manual, Sprint 7): `client.buy()` procura o
+        # símbolo pedido num dicionário local (`iqoptionapi.constants.ACTIVES`)
+        # que só vem parcialmente pré-populado — em particular, os pares
+        # "-OTC" (a maioria do que está de fato operável na prática, incluindo
+        # fora do horário do mercado à vista) NÃO estão nele até esta chamada
+        # ser feita. Sem isto, TODA ordem binária era recusada com "asset is
+        # not available at the moment", mesmo em ativos comprovadamente
+        # abertos na plataforma — confirmado revertendo esta chamada e
+        # reproduzindo o erro, depois confirmando o fix com uma ordem real
+        # que chegou a WON. VERIFICAR: nome do método/necessidade dele pode
+        # variar por fork; se o método não existir, a conexão ainda funciona,
+        # só potencialmente com o mesmo problema de símbolo não encontrado.
+        refresh_fn = getattr(client, "get_ALL_Binary_ACTIVES_OPCODE", None)
+        if callable(refresh_fn):
+            try:
+                self._call_with_timeout(self._refresh_actives_timeout_s, refresh_fn)
+            except Exception as exc:
+                raise BrokerConnectionError(
+                    f"Falha ao atualizar a lista de ativos operáveis após conectar: {exc}"
+                ) from exc
 
         self._client = client
         self._connected_account_type = AccountType.PRACTICE if target_mode == "PRACTICE" else AccountType.REAL
@@ -265,7 +288,20 @@ class IQOptionGateway(BrokerGateway):
         # caso da fork instalada, um empate pode chegar mascarado como
         # profit==0 dentro de "win"; ajuste a leitura abaixo antes de
         # confiar nisto em conta real.
-        status, profit = self._client.check_win_v4(broker_order_id)
+        #
+        # ACHADO REAL (validação manual, Sprint 7): na fork instalada,
+        # check_win_v4 indexa um dict interno por chave INTEIRA
+        # (`self.api.socket_option_closed[id_number]`) — passar a string
+        # devolvida por place_order() faz o lookup falhar silenciosamente
+        # (a exceção é engolida por um `except: pass` dentro da lib) e o
+        # busy-wait interno, que não tem timeout próprio, nunca sai.
+        # `int(broker_order_id)` é indispensável aqui, não cosmético.
+        # Envolvida em _call_with_timeout pelo mesmo motivo: sem isso, um
+        # travamento (por essa causa ou qualquer outra) bloquearia o polling
+        # inteiro além de poll_timeout_s.
+        status, profit = self._call_with_timeout(
+            self._check_win_call_timeout_s, self._client.check_win_v4, int(broker_order_id)
+        )
         if status is None:
             return None
 

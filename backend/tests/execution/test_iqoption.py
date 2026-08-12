@@ -56,6 +56,8 @@ class _FakeIQOption:
         self.connect_result = (True, None)
         self.balance = 10_000.0
         self.balance_mode = None
+        self.refresh_actives_called = False
+        self.refresh_actives_side_effect = None  # None | Exception | "hang"
 
     def connect(self):
         return self.connect_result
@@ -65,6 +67,14 @@ class _FakeIQOption:
 
     def get_balance(self):
         return self.balance
+
+    def get_ALL_Binary_ACTIVES_OPCODE(self):
+        self.refresh_actives_called = True
+        if self.refresh_actives_side_effect == "hang":
+            time.sleep(10.0)
+            return
+        if isinstance(self.refresh_actives_side_effect, Exception):
+            raise self.refresh_actives_side_effect
 
 
 def _install_fake_stable_api(monkeypatch, fake_client: "_FakeIQOption | None" = None):
@@ -146,6 +156,60 @@ def test_connect_succeeds_and_defaults_to_practice(monkeypatch):
     assert gateway.current_account_type() is AccountType.PRACTICE
     assert fake.balance_mode == "PRACTICE"
     assert gateway.get_balance() == 10_000.0
+
+
+def test_connect_refreshes_the_actives_list_when_the_client_supports_it(monkeypatch):
+    # Achado real (validação manual, Sprint 7): sem isto, buy() recusava
+    # TODA ordem binária (inclusive em ativos comprovadamente abertos) por
+    # não reconhecer o símbolo — o dicionário local de ativos só vem
+    # parcialmente populado até este refresh ser chamado.
+    fake = _FakeIQOption("a@b.com", "x")
+    _install_fake_stable_api(monkeypatch, fake)
+
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"))
+    gateway.connect()
+
+    assert fake.refresh_actives_called is True
+
+
+def test_connect_still_works_when_client_lacks_refresh_actives_method(monkeypatch):
+    # Compatibilidade com forks que não tenham esse método específico
+    # (# VERIFICAR): connect() não deve quebrar por causa disso.
+    class _NoRefreshClient(_FakeIQOption):
+        get_ALL_Binary_ACTIVES_OPCODE = None  # remove o atributo/método
+
+    fake = _NoRefreshClient("a@b.com", "x")
+    _install_fake_stable_api(monkeypatch, fake)
+
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"))
+    gateway.connect()  # não deve levantar
+
+    assert gateway.current_account_type() is AccountType.PRACTICE
+
+
+def test_connect_raises_when_refresh_actives_fails(monkeypatch):
+    fake = _FakeIQOption("a@b.com", "x")
+    fake.refresh_actives_side_effect = RuntimeError("falha simulada ao atualizar ativos")
+    _install_fake_stable_api(monkeypatch, fake)
+
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"))
+    with pytest.raises(BrokerConnectionError, match="lista de ativos"):
+        gateway.connect()
+
+
+def test_connect_times_out_when_refresh_actives_hangs(monkeypatch):
+    fake = _FakeIQOption("a@b.com", "x")
+    fake.refresh_actives_side_effect = "hang"
+    _install_fake_stable_api(monkeypatch, fake)
+
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"), refresh_actives_timeout_s=0.05)
+
+    started = time.monotonic()
+    with pytest.raises(BrokerConnectionError, match="lista de ativos"):
+        gateway.connect()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0  # bem menor que os 10s que _FakeIQOption levaria
 
 
 def test_connect_raises_two_factor_when_reason_clearly_indicates_it(monkeypatch):
@@ -270,7 +334,7 @@ class _ResultClient:
         self.check_win_digital_v2_return = (False, None)
 
     def buy(self, *args, **kwargs):
-        return True, "bin-order-1"
+        return True, "222333"  # ids binários também são numéricos (check_win_v4 faz int(order_id))
 
     def buy_digital_spot(self, *args, **kwargs):
         return True, "555111"  # ids digitais são numéricos de verdade (check_win_digital_v2 faz int(order_id))
@@ -317,7 +381,7 @@ def test_await_result_routes_binary_orders_to_check_win_v4():
     order_id = gateway.place_order(mk_request(instrument=InstrumentType.BINARY))
     result = gateway.await_result(order_id, poll_interval_s=0.01, poll_timeout_s=1.0)
 
-    assert client.check_win_v4_called_with == order_id
+    assert client.check_win_v4_called_with == int(order_id)
     assert client.check_win_digital_v2_called_with is None
     assert result.status is ExecutionStatus.WON
 
