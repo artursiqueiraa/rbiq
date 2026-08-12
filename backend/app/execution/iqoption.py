@@ -77,7 +77,13 @@ class IQOptionGateway(BrokerGateway):
         check, reason = client.connect()
         if not check:
             reason_text = str(reason or "").lower()
-            if "2fa" in reason_text or "two" in reason_text or "code" in reason_text or "verification" in reason_text:
+            # VERIFICAR: os tokens abaixo são um palpite razoável, não uma
+            # lista oficial — a fork instalada pode usar outro texto/código
+            # para 2FA. Propositalmente restritivo: tokens genéricos como
+            # "code" sozinho geram falso positivo (respostas de erro comuns
+            # como {"code":"invalid_credentials",...} também contêm "code").
+            two_factor_markers = ("2fa", "two-factor", "two_factor", "two factor", "verification_code", "verification code")
+            if any(marker in reason_text for marker in two_factor_markers):
                 raise TwoFactorAuthRequired(
                     f"Login exige verificação em duas etapas ({reason!r}). Resolva numa "
                     "sessão separada, pré-autenticada — esta chamada não tenta submeter "

@@ -13,7 +13,7 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "loguru>=0.7",
     "httpx>=0.27",
-    "iqoptionapi>=0.5",
+    "iqoptionapi",
 ]
 
 [dependency-groups]
@@ -21,6 +21,12 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
 ]
+
+[tool.uv.sources]
+# O pacote publicado no PyPI (iqoptionapi==0.5) não expõe stable_api.IQ_Option
+# (ver docs/sprints/SPRINT_7_REPORT.md, seção 8). Usamos o fork mantido do
+# GitHub, pinado por tag (nunca uma branch móvel), via git+https.
+iqoptionapi = { git = "https://github.com/iqoptionapi/iqoptionapi.git", tag = "7.0.0" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

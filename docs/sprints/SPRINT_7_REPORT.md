@@ -2,7 +2,7 @@
 ## Live Execution Engine — IQO Strategy Lab
 
 **Data:** 2026-08-12
-**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 423 testes passando (356 das Sprints 1-6 + 67 do Live Execution Engine), zero regressão. Validação manual em conta DEMO **não realizada** — depende de credenciais do usuário e de uma dependência a trocar (seção 8).
+**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 426 testes passando (356 das Sprints 1-6 + 70 do Live Execution Engine), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinado por tag (seção 8). Validação manual em conta DEMO **não realizada** — depende só de o usuário fornecer credenciais (seção 13).
 
 ---
 
@@ -97,23 +97,32 @@ A especificação pede que este adapter venha por último, com correção e segu
 - O que está instalado: só `api.py`, de baixo nível — `login()`/`buy()` mandam mensagens de websocket cruas; não existe `get_balance()`, `change_balance()`, nem `stable_api.py`.
 - O que a maioria das forks ativas expõe (e contra o que este gateway foi escrito, porque é o que uma integração real precisa): `iqoptionapi.stable_api.IQ_Option`, com `connect()`, `get_balance()`, `change_balance()`, `buy()`/`buy_digital_spot()`, `check_win_v4()`.
 
-`IQOptionGateway.connect()` detecta essa ausência explicitamente (`ImportError` de `iqoptionapi.stable_api` capturado e relançado como `BrokerConnectionError` com uma mensagem acionável) em vez de deixar a integração falhar de forma confusa mais adiante. Isso está coberto por teste rodando contra o pacote **de fato instalado** neste projeto (`test_connect_fails_clearly_against_the_currently_installed_iqoptionapi_package`) — não é uma simulação, é o comportamento real do ambiente hoje.
+`IQOptionGateway.connect()` detecta essa ausência explicitamente (`ImportError` de `iqoptionapi.stable_api` capturado e relançado como `BrokerConnectionError` com uma mensagem acionável) em vez de deixar a integração falhar de forma confusa mais adiante.
 
-**Decisão deliberada**: não escolhi nem hardcodei uma URL de fork alternativa como dependência — trocar por uma fork mantida que exponha `stable_api.IQ_Option` é uma decisão do operador (qual fork confiar é uma escolha de segurança, não uma escolha técnica que este código deva tomar sozinho).
+**Decisão inicial**: não escolhi nem hardcodei uma URL de fork alternativa como dependência por conta própria — perguntei ao usuário. Depois de confirmado, `backend/pyproject.toml` foi atualizado para `iqoptionapi @ git+https://github.com/iqoptionapi/iqoptionapi.git@7.0.0` (via `[tool.uv.sources]`, pinado por **tag**, nunca uma branch móvel) e `uv sync` resolveu e instalou o fork de fato — `iqoptionapi.stable_api.IQ_Option` agora existe no ambiente.
 
 Todo o resto de `iqoption.py` segue a especificação à risca:
 
 - **Import tardio**: `from iqoptionapi.stable_api import IQ_Option` só existe dentro de `connect()` — nunca no topo do módulo (verificado por AST, `test_no_top_level_import_of_iqoptionapi`). Nenhum outro módulo do projeto (testes, API, wiring) paga o custo/risco desse import.
 - **`# VERIFICAR`** em toda chamada da lib (`IQ_Option(...)`, `connect()`, `change_balance()`, `get_balance()`, `buy()`/`buy_digital_spot()`, `check_win_v4()`), documentando a assinatura esperada e onde ela costuma divergir entre forks.
-- **2FA**: `connect()` inspeciona o motivo de uma falha de login; se parecer 2FA (`"2fa"`/`"code"`/`"verification"` no texto), levanta `TwoFactorAuthRequired` (subclasse de `BrokerConnectionError`) e para — nenhuma tentativa de submeter código de verificação dentro do fluxo automático.
+- **2FA**: `connect()` inspeciona o motivo de uma falha de login; se contiver um marcador específico de 2FA, levanta `TwoFactorAuthRequired` (subclasse de `BrokerConnectionError`) e para — nenhuma tentativa de submeter código de verificação dentro do fluxo automático.
 - **`await_result`**: faz polling respeitando `poll_interval_s`/`poll_timeout_s`, com um `deadline` de `time.monotonic()` — nunca bloqueia além do timeout; resolve para `ExecutionStatus.ERROR` se estourar.
 - **Profit bruto, não normalizado**: `ExecutionResult.profit` recebe exatamente o `profit` que `check_win_v4` devolveria, sem nenhuma tentativa de forçá-lo à convenção do backtest (`stake*payout`) — essa reconciliação fica para uma futura camada de métricas, fora do escopo desta Sprint.
+
+### 8.1. Dois problemas reais, encontrados só depois de trocar para o fork de verdade
+
+Os testes escritos contra o pacote antigo (PyPI 0.5) passavam "verde" porque `connect()` falhava cedo, no `ImportError` — nunca chegavam a exercitar o corpo real de `connect()`. Ao trocar para o fork (seção acima), rodar a suíte revelou dois problemas que só existiam quando `stable_api.IQ_Option` está de fato disponível:
+
+1. **A suíte fazia uma chamada de rede REAL.** `IQ_Option("a@b.com", "x").connect()`, com credenciais falsas de teste, abriu uma conexão de verdade com os servidores da IQ Option (e recebeu de volta um erro de credenciais inválidas). Rodar `pytest` não pode depender de rede nem tocar a IQ Option, sob nenhuma circunstância — nem com credenciais falsas. Corrigido substituindo `sys.modules["iqoptionapi.stable_api"]` por um módulo falso (`_FakeIQOption`) antes de qualquer teste chamar `connect()`; a suíte voltou a rodar em ~1s, sem rede.
+2. **Falso positivo na detecção de 2FA.** A resposta real de erro de credenciais inválidas do fork (`'{"code":"invalid_credentials","message":"..."}'`) contém a substring `"code"` — e a checagem original (`"code" in reason_text`) classificava isso como exigência de 2FA, o que é errado: era simplesmente login/senha incorretos. Corrigido restringindo os marcadores a termos específicos de 2FA (`"2fa"`, `"two-factor"`, `"verification_code"`, etc.), removendo `"code"` e `"two"` isolados da lista. Há um teste de regressão específico para isso (`test_connect_does_not_misdetect_a_generic_json_error_as_two_factor`), usando literalmente o texto de erro observado.
+
+Isso confirma, na prática, o motivo de todo o cuidado desta seção: a API real de uma lib não-oficial só se revela por completo quando você troca de "não importa" para "importa de verdade" — os comentários `# VERIFICAR` continuam válidos, e este achado é exatamente o tipo de coisa que eles avisavam que aconteceria.
 
 ---
 
 ## 9. Testes
 
-**67 testes**, todos com `PaperBroker` ou dublês locais — nenhum toca rede:
+**70 testes**, todos com `PaperBroker` ou dublês locais — nenhum toca rede (ver seção 8.1 sobre o cuidado extra necessário em `test_iqoption.py` depois da troca de dependência):
 
 ```text
 tests/execution/test_types.py       9 testes   idempotência, normalização de direção, imutabilidade
@@ -122,7 +131,7 @@ tests/execution/test_guard.py       9 testes   kill switch, as 3 regras de risco
 tests/execution/test_paper.py      10 testes   WON/LOST/TIE semeados, saldo, recusas forçadas
 tests/execution/test_executor.py   11 testes   pipeline completo, nunca-levanta, idempotência, stake fixo
 tests/execution/test_isolation.py   3 testes   AST: backtest <-> execution nunca se importam
-tests/execution/test_iqoption.py    9 testes   import tardio, as 3 travas (ponto 3), erro real de dependência
+tests/execution/test_iqoption.py   16 testes   import tardio, as 3 travas (ponto 3), ImportError/2FA herméticos
 ```
 
 Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do_not` e os dois vizinhos de `max_daily_trades`/`max_daily_loss`) pegou um bug real durante o desenvolvimento: `record_placed()`/`record_resolved()` alteravam `GuardState` sem antes rolar o dia (`_roll_day_if_needed()`), então um `check()` chamado depois via a `current_day=None` inicial e **zerava** os contadores que tinham acabado de ser incrementados. Corrigido chamando `_roll_day_if_needed()` também nos dois métodos de registro, não só em `check()`.
@@ -132,7 +141,7 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 ## 10. Regressão
 
 ```text
-423 testes passando (356 das Sprints 1-6 + 67 novos), 0 falhas, contra PostgreSQL real.
+426 testes passando (356 das Sprints 1-6 + 70 novos), 0 falhas, contra PostgreSQL real.
 ```
 
 ---
@@ -148,18 +157,19 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 
 ## 12. Dependências
 
-Uma nova: `iqoptionapi>=0.5` (`pyproject.toml`, autorizado explicitamente pelo usuário). Ver seção 8 para a ressalva sobre essa versão específica do pacote.
+Uma nova: `iqoptionapi` (`pyproject.toml`), resolvida via `[tool.uv.sources]` para o fork `git+https://github.com/iqoptionapi/iqoptionapi.git@7.0.0` — pinado por tag, não uma branch móvel. Autorizada explicitamente pelo usuário em dois passos: primeiro a instalação inicial (PyPI, que se revelou insuficiente — seção 8), depois a troca para este fork. `uv.lock` reflete a resolução real.
 
 `.env.example` recebeu `IQOPTION_EMAIL`/`IQOPTION_PASSWORD` (vazios, nunca preenchidos aqui) — únicas variáveis que `Credentials.from_env()` lê.
+
+`backend/scripts/verify_iqoption.py` (fornecido pelo usuário, adicionado ao repositório): script standalone para validar manualmente, contra o fork agora instalado, que os pontos `# VERIFICAR` do adapter batem com a realidade — conecta, confirma conta PRACTICE, lê saldo e, com `--probe-order`, coloca UMA ordem demo mínima para inspecionar o formato real de `buy()`/`check_win`. Lê credenciais só do ambiente, nunca do código; nunca deve ser apontado para conta REAL. Não foi executado nesta Sprint (depende de credenciais de conta demo do usuário — seção 13, pendência 1).
 
 ---
 
 ## 13. Pendências
 
-1. **Fork de `iqoptionapi`**: trocar a dependência instalada por uma fork mantida que exponha `stable_api.IQ_Option`, antes de qualquer tentativa de conexão real (seção 8). Decisão do operador — não tomada por conta própria.
-2. **Validação manual em conta DEMO**: a Definition of Done da especificação pede "validação manual de UMA ordem em conta DEMO documentada" — não realizada nesta Sprint porque depende de (a) a pendência acima resolvida e (b) o usuário fornecer credenciais de uma conta demo real e consentir explicitamente com uma tentativa de conexão de rede. Nenhuma credencial foi solicitada ou usada até aqui.
-3. **Persistência/API/frontend**: assim como a Sprint 6, esta Sprint entrega só o engine + `InMemoryExecutionRepository`. Não há tabela `execution_records` no Postgres, endpoint de API, nem página de frontend — decisão consistente com o precedente já aberto na Sprint 6 (ver relatório anterior, seção 14), a ser resolvida junto com aquela pendência quando o usuário decidir.
-4. **Escala/concorrência**: o modelo é sequencial (uma ordem por vez, `max_concurrent_orders` por padrão limita a isso) — igual ao Backtest Engine. Múltiplas ordens simultâneas (relevante para operar vários símbolos em paralelo) é extensão futura, fora do escopo desta Sprint.
+1. **Validação manual em conta DEMO**: a Definition of Done da especificação pede "validação manual de UMA ordem em conta DEMO documentada". A dependência necessária para isso (fork com `stable_api.IQ_Option`) já está instalada e o script (`backend/scripts/verify_iqoption.py`) já está no repositório — falta apenas o usuário fornecer credenciais de uma conta demo real (via `IQOPTION_EMAIL`/`IQOPTION_PASSWORD` no ambiente, nunca no código) e rodar `uv run python scripts/verify_iqoption.py` (opcionalmente `--probe-order`) a partir de `backend/`. Nenhuma credencial foi solicitada ou usada nesta Sprint.
+2. **Persistência/API/frontend**: assim como a Sprint 6, esta Sprint entrega só o engine + `InMemoryExecutionRepository`. Não há tabela `execution_records` no Postgres, endpoint de API, nem página de frontend — decisão consistente com o precedente já aberto na Sprint 6 (ver relatório anterior, seção 14), a ser resolvida junto com aquela pendência quando o usuário decidir.
+3. **Escala/concorrência**: o modelo é sequencial (uma ordem por vez, `max_concurrent_orders` por padrão limita a isso) — igual ao Backtest Engine. Múltiplas ordens simultâneas (relevante para operar vários símbolos em paralelo) é extensão futura, fora do escopo desta Sprint.
 
 ---
 
