@@ -247,6 +247,7 @@ dependencies = [
     { name = "alembic" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "iqoptionapi" },
     { name = "loguru" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
@@ -266,6 +267,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.14" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "iqoptionapi", specifier = ">=0.5" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.9" },
@@ -279,6 +281,12 @@ dev = [
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
 ]
+
+[[package]]
+name = "iqoptionapi"
+version = "0.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/47/e5/9d7ecf1c519b7ae587ffad7ff6c26b0cbf0eef54ecc19ea5d6188a7d15f6/iqoptionapi-0.5.tar.gz", hash = "sha256:7c24146400b67122bf4a18df89ca17de2033148708d6169137bcd0d99ba932b3", size = 7053, upload-time = "2016-10-14T23:03:46.653Z" }
 
 [[package]]
 name = "loguru"
