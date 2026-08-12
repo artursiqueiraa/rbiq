@@ -32,8 +32,9 @@ acontecer numa sessão pré-autenticada separada, fora do loop de trading.
 
 from __future__ import annotations
 
+import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .broker import BrokerConnectionError, BrokerGateway, BrokerRejectionError
 from .config import Credentials
@@ -46,11 +47,57 @@ class TwoFactorAuthRequired(BrokerConnectionError):
 
 
 class IQOptionGateway(BrokerGateway):
-    def __init__(self, credentials: Credentials, practice_by_default: bool = True) -> None:
+    def __init__(
+        self,
+        credentials: Credentials,
+        practice_by_default: bool = True,
+        place_order_timeout_s: float = 15.0,
+    ) -> None:
         self._credentials = credentials
         self._practice_by_default = practice_by_default
+        self._place_order_timeout_s = place_order_timeout_s
         self._client: Any = None
         self._connected_account_type: Optional[AccountType] = None
+
+    def _call_with_timeout(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """Roda `fn(*args)` numa thread daemon, com timeout próprio.
+
+        Achado real (Sprint 7, validação manual em DEMO): pelo menos um
+        método do fork instalado (`buy_digital_spot`) tem um busy-wait
+        interno SEM timeout, esperando a corretora confirmar o id da ordem —
+        se ela nunca confirmar (ex.: ativo fechado), a chamada trava para
+        sempre, ANTES de `await_result`/`poll_timeout_s` sequer entrarem em
+        jogo. Confirmado na prática: a chamada não retornou em 85s reais.
+
+        Não existe como matar uma thread Python à força. Se o timeout
+        estourar, a thread de origem continua rodando em segundo plano
+        (marcada `daemon=True` só para não impedir o processo de encerrar) e
+        seu resultado, se algum dia chegar, é descartado — o chamador já
+        seguiu em frente tratando isso como `BrokerConnectionError`: o
+        resultado real da ordem fica DESCONHECIDO, não confirmado nem
+        recusado. É uma mitigação, não uma cura — a causa raiz é um bug do
+        fork de terceiros, fora do nosso controle."""
+        outcome: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                outcome["value"] = fn(*args)
+            except Exception as exc:  # repassado à thread principal via dict
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(self._place_order_timeout_s)
+
+        if thread.is_alive():
+            raise BrokerConnectionError(
+                f"Chamada à corretora não respondeu em {self._place_order_timeout_s}s "
+                "(timeout de proteção interno do gateway). O resultado real da ordem é "
+                "DESCONHECIDO — pode ter sido aceita ou não; não assuma nenhum dos dois."
+            )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
 
     def connect(self) -> None:
         # Import tardio, de propósito — NUNCA no topo do módulo (seção 9):
@@ -133,13 +180,15 @@ class IQOptionGateway(BrokerGateway):
 
         if request.instrument is InstrumentType.DIGITAL:
             # VERIFICAR: buy_digital_spot(active, amount, action, duration) -> (bool, order_id)
-            ok, order_id = self._client.buy_digital_spot(
-                request.symbol, request.stake, broker_direction, request.expiry_minutes
+            # Envolvida em _call_with_timeout: este método especificamente
+            # pode travar sem retornar (ver docstring de _call_with_timeout).
+            ok, order_id = self._call_with_timeout(
+                self._client.buy_digital_spot, request.symbol, request.stake, broker_direction, request.expiry_minutes
             )
         else:
             # VERIFICAR: buy(amount, active, action, expirations) -> (bool, order_id)
-            ok, order_id = self._client.buy(
-                request.stake, request.symbol, broker_direction, request.expiry_minutes
+            ok, order_id = self._call_with_timeout(
+                self._client.buy, request.stake, request.symbol, broker_direction, request.expiry_minutes
             )
 
         if not ok or order_id is None:

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -205,3 +206,53 @@ def test_place_order_proceeds_when_session_account_matches_request_account():
     order_id = gateway.place_order(mk_request(account_type=AccountType.PRACTICE))
     assert order_id == "order-123"
     assert dummy.buy_called is True
+
+
+class _HangingClient:
+    """Simula o achado real: buy()/buy_digital_spot() nunca retorna."""
+
+    def buy(self, *args, **kwargs):
+        time.sleep(10.0)
+        return True, "nunca-chega-aqui"
+
+    buy_digital_spot = buy
+
+
+class _RaisingClient:
+    def buy(self, *args, **kwargs):
+        raise RuntimeError("falha simulada da lib")
+
+
+def test_place_order_times_out_instead_of_hanging_forever():
+    # Achado real (Sprint 7, validação manual em DEMO): buy_digital_spot()
+    # travou de verdade por 85s+ nesse fork. place_order() precisa devolver
+    # um erro em tempo limitado, nunca travar o processo indefinidamente.
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"), place_order_timeout_s=0.05)
+    gateway._client = _HangingClient()
+    gateway._connected_account_type = AccountType.PRACTICE
+
+    started = time.monotonic()
+    with pytest.raises(BrokerConnectionError, match="não respondeu"):
+        gateway.place_order(mk_request(account_type=AccountType.PRACTICE))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0  # bem menor que os 10s que _HangingClient levaria
+
+
+def test_place_order_propagates_exceptions_raised_by_the_broker_call():
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"), place_order_timeout_s=5.0)
+    gateway._client = _RaisingClient()
+    gateway._connected_account_type = AccountType.PRACTICE
+
+    with pytest.raises(RuntimeError, match="falha simulada"):
+        gateway.place_order(mk_request(account_type=AccountType.PRACTICE))
+
+
+def test_place_order_within_timeout_still_returns_normally():
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"), place_order_timeout_s=5.0)
+    dummy = _DummyClient()
+    gateway._client = dummy
+    gateway._connected_account_type = AccountType.PRACTICE
+
+    order_id = gateway.place_order(mk_request(account_type=AccountType.PRACTICE))
+    assert order_id == "order-123"

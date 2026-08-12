@@ -2,7 +2,7 @@
 ## Live Execution Engine — IQO Strategy Lab
 
 **Data:** 2026-08-12
-**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 426 testes passando (356 das Sprints 1-6 + 70 do Live Execution Engine), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinado por tag (seção 8). Validação manual em conta DEMO **não realizada** — depende só de o usuário fornecer credenciais (seção 13).
+**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 429 testes passando (356 das Sprints 1-6 + 73 do Live Execution Engine), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinado por tag (seção 8). Validação manual em conta DEMO **realizada** (seção 8.2): conexão e saldo confirmados; achado um bug real de hang em `buy_digital_spot()`, corrigido com timeout próprio no gateway e validado de novo contra a conta real.
 
 ---
 
@@ -118,11 +118,30 @@ Os testes escritos contra o pacote antigo (PyPI 0.5) passavam "verde" porque `co
 
 Isso confirma, na prática, o motivo de todo o cuidado desta seção: a API real de uma lib não-oficial só se revela por completo quando você troca de "não importa" para "importa de verdade" — os comentários `# VERIFICAR` continuam válidos, e este achado é exatamente o tipo de coisa que eles avisavam que aconteceria.
 
+### 8.2. Validação manual em conta DEMO — realizada
+
+Rodado `backend/scripts/verify_iqoption.py` contra uma conta demo real, com o usuário fornecendo `IQOPTION_EMAIL`/`IQOPTION_PASSWORD` só no `.env` local (nunca colado no chat) — eu carreguei essas duas variáveis num subprocesso, sem nunca as ler nem imprimir.
+
+**Resultados:**
+
+1. **Conexão e conta PRACTICE confirmadas.** `connect()` funcionou de primeira, `change_balance("PRACTICE")` e `get_balance()` bateram — saldo demo lido com sucesso. Confirma as travas 3 (`current_account_type()`) na prática, não só em teste.
+2. **Vazamento de PII encontrado e corrigido no script.** A primeira versão de `verify_iqoption.py` (fornecida pelo usuário) imprimia o retorno bruto de `get_balances()`/`get_profile_ansyc()` — que inclui nome completo, endereço, cidade, CEP, telefone, data de nascimento, status de KYC e um campo `skey` (aparenta ser um token de sessão). Isso apareceu na conversa antes de eu perceber. Corrigido imediatamente: o script agora só imprime um resumo redigido por saldo (id/tipo/moeda/valor), nunca o payload de perfil inteiro. Fica registrado aqui porque é exatamente o tipo de risco que scripts de diagnóstico contra APIs de terceiros costumam introduzir sem querer — vale a mesma atenção em qualquer ferramenta futura que toque `get_profile*`/`get_balances`.
+3. **`buy()` (opção binária clássica) recusado em dois ativos diferentes** (EURUSD e BTCUSD), mesma mensagem: `"Cannot purchase an option (the asset is not available at the moment)"`. Não é um bug — indica que essa conta/região provavelmente só tem opções digitais disponíveis (a IQ Option vem descontinuando binário clássico amplamente). Confirma, na prática, que `IQOptionGateway` precisa do caminho `InstrumentType.DIGITAL` para ser realmente utilizável nesta conta, não só o binário.
+4. **Bug real e sério encontrado: `buy_digital_spot()` trava sem retornar.** Estendido o script com `--instrument digital` e testado contra BTCUSD: a chamada não retornou em 85s (limite externo que eu apliquei). Lendo o código-fonte do método no fork instalado, a causa é um `while self.api.digital_option_placed_id.get(request_id) == None: pass` — um busy-wait sem nenhum timeout próprio, esperando a corretora confirmar o id da ordem. Se ela nunca confirmar, a chamada trava para sempre.
+
+   **Isso é um problema real para `IQOptionGateway.place_order()`**: antes desta correção, ele chamava `buy()`/`buy_digital_spot()` diretamente, síncrono — um travamento desses prenderia o processo inteiro indefinidamente, ANTES de `await_result`/`poll_timeout_s` entrarem em jogo, e até o kill switch ficaria inacessível (o processo nem processa novos sinais nem reage a `kill_switch=True` se está preso dentro dessa chamada).
+
+   **Corrigido**: `IQOptionGateway` ganhou `_call_with_timeout()` — roda a chamada da lib numa thread daemon, com um timeout próprio configurável (`place_order_timeout_s`, default 15s). Se estourar, levanta `BrokerConnectionError` (resultado da ordem fica **desconhecido**, não confirmado nem recusado — nunca tratado como se fosse uma recusa limpa). A thread de origem, presa dentro do busy-wait do fork, continua rodando em segundo plano (não há como matar uma thread Python à força) — marcada `daemon=True` só para não impedir o processo de encerrar; seu resultado, se um dia chegar, é descartado. É uma mitigação do lado de cá para um bug de uma lib de terceiros, não uma cura.
+
+   **Validado de novo contra a conta real** depois da correção: `place_order()` com `InstrumentType.DIGITAL` agora devolve `BrokerConnectionError` em exatamente 15,0s (o timeout configurado), em vez de travar — confirmado com um script de validação ad-hoc (não commitado, rodado do scratchpad), medindo o tempo decorrido.
+
+   3 testes novos cobrem isso hermeticamente (`test_place_order_times_out_instead_of_hanging_forever`, `test_place_order_propagates_exceptions_raised_by_the_broker_call`, `test_place_order_within_timeout_still_returns_normally`).
+
 ---
 
 ## 9. Testes
 
-**70 testes**, todos com `PaperBroker` ou dublês locais — nenhum toca rede (ver seção 8.1 sobre o cuidado extra necessário em `test_iqoption.py` depois da troca de dependência):
+**73 testes**, todos com `PaperBroker` ou dublês locais — nenhum toca rede (ver seções 8.1/8.2 sobre o cuidado extra necessário em `test_iqoption.py` depois da troca de dependência e da validação manual):
 
 ```text
 tests/execution/test_types.py       9 testes   idempotência, normalização de direção, imutabilidade
@@ -131,7 +150,7 @@ tests/execution/test_guard.py       9 testes   kill switch, as 3 regras de risco
 tests/execution/test_paper.py      10 testes   WON/LOST/TIE semeados, saldo, recusas forçadas
 tests/execution/test_executor.py   11 testes   pipeline completo, nunca-levanta, idempotência, stake fixo
 tests/execution/test_isolation.py   3 testes   AST: backtest <-> execution nunca se importam
-tests/execution/test_iqoption.py   16 testes   import tardio, as 3 travas (ponto 3), ImportError/2FA herméticos
+tests/execution/test_iqoption.py   19 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de place_order
 ```
 
 Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do_not` e os dois vizinhos de `max_daily_trades`/`max_daily_loss`) pegou um bug real durante o desenvolvimento: `record_placed()`/`record_resolved()` alteravam `GuardState` sem antes rolar o dia (`_roll_day_if_needed()`), então um `check()` chamado depois via a `current_day=None` inicial e **zerava** os contadores que tinham acabado de ser incrementados. Corrigido chamando `_roll_day_if_needed()` também nos dois métodos de registro, não só em `check()`.
@@ -141,7 +160,7 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 ## 10. Regressão
 
 ```text
-426 testes passando (356 das Sprints 1-6 + 70 novos), 0 falhas, contra PostgreSQL real.
+429 testes passando (356 das Sprints 1-6 + 73 novos), 0 falhas, contra PostgreSQL real.
 ```
 
 ---
@@ -152,6 +171,7 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 - **`ExecutionRecord.request` é `Optional[OrderRequest]`**: o único caso em que fica `None` é um `Signal` tão malformado que nem `.direction` existe — aí o executor ainda produz um registro auditável (`status=ERROR`) em vez de deixar a exceção escapar, honrando "nunca levanta" de forma literal, inclusive para entradas inválidas.
 - **`GuardState` é um objeto separado, passado explicitamente ao `ExecutionGuard`**: permite testes inspecionarem o estado diretamente e deixa a porta aberta para persistência futura sem acoplar a guarda a um mecanismo de storage específico.
 - **`InMemoryExecutionRepository`, sem tabela Postgres própria**: mesma decisão da Sprint 6 para o `BacktestResultRepository` — o Protocol já define o contrato (`save`/`get`/`get_by_idempotency_key`/`list_all`); implementar sobre Postgres fica para quando a API/persistência completa desta engine for pedida explicitamente (ver pendências).
+- **`IQOptionGateway._call_with_timeout()`**: chamadas de compra passam por uma thread daemon com timeout próprio (`place_order_timeout_s`, default 15s), em vez de confiar que a lib de terceiros sempre retorna. Motivado por um bug real encontrado na validação manual (seção 8.2) — `buy_digital_spot()` pode travar indefinidamente nesse fork. Como não há como matar uma thread Python à força, a mitigação é limitar quanto tempo o `LiveExecutor` fica bloqueado esperando, não garantir que a chamada de fato pare.
 
 ---
 
@@ -161,15 +181,15 @@ Uma nova: `iqoptionapi` (`pyproject.toml`), resolvida via `[tool.uv.sources]` pa
 
 `.env.example` recebeu `IQOPTION_EMAIL`/`IQOPTION_PASSWORD` (vazios, nunca preenchidos aqui) — únicas variáveis que `Credentials.from_env()` lê.
 
-`backend/scripts/verify_iqoption.py` (fornecido pelo usuário, adicionado ao repositório): script standalone para validar manualmente, contra o fork agora instalado, que os pontos `# VERIFICAR` do adapter batem com a realidade — conecta, confirma conta PRACTICE, lê saldo e, com `--probe-order`, coloca UMA ordem demo mínima para inspecionar o formato real de `buy()`/`check_win`. Lê credenciais só do ambiente, nunca do código; nunca deve ser apontado para conta REAL. Não foi executado nesta Sprint (depende de credenciais de conta demo do usuário — seção 13, pendência 1).
+`backend/scripts/verify_iqoption.py` (fornecido pelo usuário, adicionado ao repositório, depois corrigido por mim para nunca imprimir o payload bruto de perfil/PII — seção 8.2): script standalone para validar manualmente, contra o fork instalado, que os pontos `# VERIFICAR` do adapter batem com a realidade — conecta, confirma conta PRACTICE, lê saldo e, com `--probe-order` (`--instrument binary|digital`), coloca UMA ordem demo mínima para inspecionar o formato real de `buy()`/`buy_digital_spot()`/`check_win`. Lê credenciais só do ambiente, nunca do código; nunca deve ser apontado para conta REAL. **Executado nesta Sprint** contra uma conta demo real — resultados na seção 8.2.
 
 ---
 
 ## 13. Pendências
 
-1. **Validação manual em conta DEMO**: a Definition of Done da especificação pede "validação manual de UMA ordem em conta DEMO documentada". A dependência necessária para isso (fork com `stable_api.IQ_Option`) já está instalada e o script (`backend/scripts/verify_iqoption.py`) já está no repositório — falta apenas o usuário fornecer credenciais de uma conta demo real (via `IQOPTION_EMAIL`/`IQOPTION_PASSWORD` no ambiente, nunca no código) e rodar `uv run python scripts/verify_iqoption.py` (opcionalmente `--probe-order`) a partir de `backend/`. Nenhuma credencial foi solicitada ou usada nesta Sprint.
-2. **Persistência/API/frontend**: assim como a Sprint 6, esta Sprint entrega só o engine + `InMemoryExecutionRepository`. Não há tabela `execution_records` no Postgres, endpoint de API, nem página de frontend — decisão consistente com o precedente já aberto na Sprint 6 (ver relatório anterior, seção 14), a ser resolvida junto com aquela pendência quando o usuário decidir.
-3. **Escala/concorrência**: o modelo é sequencial (uma ordem por vez, `max_concurrent_orders` por padrão limita a isso) — igual ao Backtest Engine. Múltiplas ordens simultâneas (relevante para operar vários símbolos em paralelo) é extensão futura, fora do escopo desta Sprint.
+1. **Persistência/API/frontend**: assim como a Sprint 6, esta Sprint entrega só o engine + `InMemoryExecutionRepository`. Não há tabela `execution_records` no Postgres, endpoint de API, nem página de frontend — decisão consistente com o precedente já aberto na Sprint 6 (ver relatório anterior, seção 14), a ser resolvida junto com aquela pendência quando o usuário decidir.
+2. **Escala/concorrência**: o modelo é sequencial (uma ordem por vez, `max_concurrent_orders` por padrão limita a isso) — igual ao Backtest Engine. Múltiplas ordens simultâneas (relevante para operar vários símbolos em paralelo) é extensão futura, fora do escopo desta Sprint.
+3. **`buy()` binário indisponível nesta conta**: confirmado na validação manual (seção 8.2) que opções binárias clássicas foram recusadas em dois ativos diferentes — só `InstrumentType.DIGITAL` se mostrou potencialmente utilizável nesta conta/região. Nenhuma ordem digital foi confirmada com sucesso ainda (o teste real bateu no bug de hang, corrigido, mas não foi re-tentado até uma resolução bem-sucedida) — vale tentar de novo em outro horário/ativo antes de considerar o caminho digital totalmente validado ponta a ponta.
 
 ---
 

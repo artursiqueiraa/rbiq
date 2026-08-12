@@ -65,6 +65,12 @@ def main() -> None:
     parser.add_argument("--symbol", default="EURUSD")
     parser.add_argument("--amount", type=float, default=1.0)
     parser.add_argument("--duration", type=int, default=1, help="minutos")
+    parser.add_argument(
+        "--instrument", choices=["binary", "digital"], default="binary",
+        help="binary usa buy() (opção clássica); digital usa buy_digital_spot() "
+             "(pode ser a única disponível — IQ Option vem descontinuando binário "
+             "clássico em várias contas/regiões)",
+    )
     args = parser.parse_args()
 
     email, password = get_credentials()
@@ -86,25 +92,53 @@ def main() -> None:
     balance_before = api.get_balance()
     print(f"conta ativa: PRACTICE | get_balance() = {balance_before}")
 
-    # tenta listar os dois saldos, se o fork expuser (só informativo)
-    for attr in ("get_balances", "get_profile_ansyc", "get_currency"):
-        fn = getattr(api, attr, None)
-        if callable(fn):
-            try:
-                print(f"  {attr}() -> {fn()}")
-            except Exception as e:
-                print(f"  {attr}() falhou: {e}")
+    # get_currency() é só um código (ex.: "USD") — seguro imprimir inteiro.
+    currency_fn = getattr(api, "get_currency", None)
+    if callable(currency_fn):
+        try:
+            print(f"  get_currency() -> {currency_fn()}")
+        except Exception as e:
+            print(f"  get_currency() falhou: {e}")
+
+    # get_balances()/get_profile_ansyc() devolvem o perfil bruto da conta:
+    # nome, endereço, telefone, data de nascimento, KYC, e um campo "skey"
+    # que parece um token de sessão. NUNCA imprimir esse payload inteiro —
+    # só um resumo redigido (saldo por moeda/tipo), sem PII nem tokens.
+    balances_fn = getattr(api, "get_balances", None)
+    if callable(balances_fn):
+        try:
+            balances = balances_fn().get("msg", [])
+            print("  saldos por moeda (resumo redigido):")
+            for b in balances:
+                print(f"    id={b.get('id')} type={b.get('type')} "
+                      f"currency={b.get('currency')} amount={b.get('amount')}")
+        except Exception as e:
+            print(f"  get_balances() falhou: {e}")
 
     if not args.probe_order:
         print("\nOK. Conexão + conta demo + saldo confirmados (read-only).")
         print("Rode com --probe-order para inspecionar o retorno de uma ordem demo.")
         return
 
-    print("\n== 3. ordem DEMO mínima (dinheiro fake) ==")
-    print(f"buy(amount={args.amount}, active={args.symbol!r}, action='call', "
-          f"duration={args.duration})")
-    # VERIFICAR: assinatura e retorno de buy() no seu fork -> (status, id)
-    ok, order_id = api.buy(args.amount, args.symbol, "call", args.duration)
+    print(f"\n== 3. ordem DEMO mínima, instrumento={args.instrument} (dinheiro fake) ==")
+
+    if args.instrument == "digital":
+        print(f"buy_digital_spot(active={args.symbol!r}, amount={args.amount}, "
+              f"action='call', duration={args.duration})")
+        # VERIFICAR: no fork instalado, buy_digital_spot() faz um busy-wait
+        # (`while ...: pass`) SEM timeout próprio enquanto aguarda o id da
+        # ordem — se a corretora nunca confirmar (ex.: ativo fechado), essa
+        # chamada pode travar indefinidamente, ANTES de qualquer lógica de
+        # await_result/poll_timeout_s do nosso lado sequer começar. Isso é
+        # uma limitação real do fork, não do nosso adapter — documentar como
+        # achado conhecido antes de confiar nisso em produção.
+        ok, order_id = api.buy_digital_spot(args.symbol, args.amount, "call", args.duration)
+    else:
+        print(f"buy(amount={args.amount}, active={args.symbol!r}, action='call', "
+              f"duration={args.duration})")
+        # VERIFICAR: assinatura e retorno de buy() no seu fork -> (status, id)
+        ok, order_id = api.buy(args.amount, args.symbol, "call", args.duration)
+
     print(f"buy -> status={ok!r} order_id={order_id!r}")
     if not ok:
         sys.exit(f"Corretora rejeitou a ordem demo: {order_id!r}")
@@ -114,10 +148,14 @@ def main() -> None:
     resolved = False
     while time.monotonic() < deadline:
         try:
-            # VERIFICAR: método/retorno de resultado no seu fork
-            result, profit = api.check_win_v4(int(order_id))
+            if args.instrument == "digital":
+                # VERIFICAR: método/retorno específico de opção digital
+                result, profit = api.check_win_digital_v2(int(order_id))
+            else:
+                # VERIFICAR: método/retorno de resultado no seu fork
+                result, profit = api.check_win_v4(int(order_id))
         except Exception as e:
-            print(f"  check_win_v4 indisponível/erro: {e} — tentando check_win_v3")
+            print(f"  check_win indisponível/erro: {e} — tentando check_win_v3")
             try:
                 profit = api.check_win_v3(int(order_id))
                 result = True
