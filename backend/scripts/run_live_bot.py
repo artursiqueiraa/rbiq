@@ -13,6 +13,15 @@ comando (senha não fica em texto plano em disco nem aparece em `ps`/histórico
 de shell). Só opera em conta PRACTICE — não existe caminho neste script para
 ligar REAL.
 
+`min_confidence` (perguntado na inicialização, default 0.75) é repassado à
+estratégia — cada `Signal` já carrega um `confidence` (Sprint 5,
+`app/strategies/base.py::decide_direction`), calculado a partir de quantas
+condições técnicas da estratégia bateram; um sinal só é gerado se cruzar
+esse mínimo. IMPORTANTE: isso é uma pontuação baseada em regras, não uma
+taxa de acerto histórica medida — para saber a taxa de acerto real de uma
+estratégia num par específico, use o Backtest Engine (Sprint 6) contra
+dados históricos daquele par antes de operar ao vivo.
+
 Uso (a partir de backend/, com o ambiente uv já sincronizado):
     uv run python scripts/run_live_bot.py
 
@@ -86,8 +95,14 @@ def main() -> None:
 
     print("\nEstratégias disponíveis:", ", ".join(StrategyRegistry.names()))
     strategy_name = ask("Estratégia", StrategyRegistry.names()[0])
+
+    min_confidence = ask_float(
+        "Confiança mínima para entrar (0.0 a 1.0 — mais alto = mais seletivo, menos entradas)", 0.75
+    )
+    min_confidence = min(max(min_confidence, 0.0), 1.0)  # nunca fora de [0, 1]
+
     try:
-        strategy = StrategyRegistry.create(strategy_name)
+        StrategyRegistry.create(strategy_name, min_confidence=min_confidence)  # só valida os parâmetros
     except ValueError as exc:
         sys.exit(str(exc))
 
@@ -108,11 +123,12 @@ def main() -> None:
     )
 
     print("\nResumo:")
-    print(f"  estratégia   : {strategy_name}")
-    print(f"  paridades    : {', '.join(symbols)}")
-    print(f"  stake        : {stake} por ordem, conta PRACTICE (demo)")
-    print(f"  expiração    : {expiry_minutes} min")
-    print(f"  intervalo    : a cada {poll_interval_s}s")
+    print(f"  estratégia       : {strategy_name}")
+    print(f"  confiança mínima : {min_confidence:.2f} (sinais mais fracos que isso são ignorados)")
+    print(f"  paridades        : {', '.join(symbols)}")
+    print(f"  stake            : {stake} por ordem, conta PRACTICE (demo)")
+    print(f"  expiração        : {expiry_minutes} min")
+    print(f"  intervalo        : a cada {poll_interval_s}s")
     confirm = ask("\nConfirma o início do loop? (s/N)", "N")
     if confirm.lower() not in ("s", "sim", "y", "yes"):
         print("Cancelado.")
@@ -137,7 +153,7 @@ def main() -> None:
         LiveTradingLoop(
             candle_source=gateway,
             executor=executor,
-            strategy=StrategyRegistry.create(strategy_name),  # instância própria por símbolo
+            strategy=StrategyRegistry.create(strategy_name, min_confidence=min_confidence),  # instância própria por símbolo
             symbol=symbol,
             timeframe=Timeframe.M1,
             poll_interval_s=poll_interval_s,

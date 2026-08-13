@@ -206,6 +206,16 @@ O usuário rodou o script diretamente (`uv run python scripts/run_live_bot.py`),
 
 Não é uma pendência a resolver — é o comportamento esperado de uma corretora de opções binárias, e o sistema já reage a isso corretamente (tenta de novo no próximo ciclo, a cada `poll_interval_s`). Registrado aqui como o terceiro tipo de recusa documentado nesta Sprint, para o operador reconhecer a mensagem no futuro sem estranhar.
 
+### 8.8. `min_confidence` exposto no CLI
+
+Depois de observar o loop rodando, o usuário reportou "entradas desgovernadas" e pediu um filtro por confiança mínima antes de operar. Isso já existia no Strategy Engine (Sprint 5) — todo `Signal` carrega `confidence: float`, e `decide_direction()` (`app/strategies/base.py`) só gera um sinal se ele cruzar `min_confidence` (default `0.70`, seção 9 da spec da Sprint 5) — mas `scripts/run_live_bot.py` nunca expunha esse parâmetro: toda estratégia era criada com `StrategyRegistry.create(strategy_name)`, sempre no default.
+
+Corrigido: o CLI agora pergunta "Confiança mínima para entrar" (default `0.75`, sugerido levemente acima do default da estratégia — mais seletivo), passa isso para `StrategyRegistry.create(strategy_name, min_confidence=...)` em cada `LiveTradingLoop`, e imprime o valor escolhido no resumo antes de confirmar.
+
+**Ressalva documentada explicitamente ao usuário e no docstring do script**: `confidence` é uma pontuação baseada em regras (proporção de condições técnicas da estratégia que bateram), calculada em tempo real a cada candle — **não é uma taxa de acerto histórica medida**. Para saber a taxa de acerto real de uma estratégia contra um par específico, o instrumento correto é o Backtest Engine (Sprint 6) contra dados históricos daquele par, não este parâmetro. Essa distinção já era uma regra do projeto (Sprint 5: "no profitability claims"; Sprint 6: resultados de backtest nunca são afirmação de lucratividade) — reafirmada aqui para não deixar o operador achar que `min_confidence` alto significa "taxa de acerto garantida".
+
+Também vale registrar uma proteção que já existia sem ter sido comunicada antes: como todos os `LiveTradingLoop` de uma sessão compartilham o mesmo `ExecutionGuard` (`max_concurrent_orders=1` por padrão), só UMA ordem fica aberta por vez entre TODOS os pares operados — um sinal de um segundo par enquanto o primeiro ainda está pendente é rejeitado pela guarda (`LIMITE_DE_ORDENS_CONCORRENTES_ATINGIDO`), não enviado. Contribui para a sensação de "menos desgovernado" mesmo sem mexer em `min_confidence`.
+
 ---
 
 ## 9. Testes
