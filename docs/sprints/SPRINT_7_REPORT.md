@@ -247,6 +247,22 @@ O usuário pediu explicitamente para não ter que digitar paridades às cegas: "
 - **Validado ponta a ponta contra a conta real**: 3 pares (`USDPHP-OTC`, `AXY`, `DXY`) x 2 estratégias (`pullback`, `trend_following`) → 6 backtests reais, resultados diferentes por combinação (win_rate entre 47,5% e 54,8%, expectancy variando de -0.107 a +0.040) — confirma que o ranking reflete diferenças reais entre combinações, não ruído.
 - **Custo de tempo, documentado no próprio script antes de rodar**: cada combinação é um backtest real (mesmo motor de ~2,3s/500 candles observado na Sprint 6) mais uma busca de candles por par — um escopo default de 15 pares x 6 estratégias pode levar vários minutos. O script avisa a estimativa antes de começar e imprime progresso, em vez de deixar o operador sem saber se travou.
 
+### 8.12. Rodada real do screener + `PullbackZones`, uma sétima estratégia
+
+Rodado `screen_pairs.py` de verdade contra a conta (15 pares x 6 estratégias = 90 backtests, 500 candles, min_confidence=0.75). Melhor combinação encontrada: **`Magnificent7-op` + `price_action`** — 211 trades, win_rate 59,8%, expectancy +0.1232, profit_factor 1,31. Achado notável: `breakout` não gerou NENHUM trade em 12 dos 15 pares testados nesse recorte de ~8h — não é bug (lido o código, a lógica de scoring é simétrica e correta), é a estratégia sendo genuinamente seletiva; combinações com 1-5 trades e "100% de acerto" também apareceram no log completo e foram corretamente excluídas do ranking final pelo filtro de mínimo de trades — o filtro funcionando como desenhado, separando sinal de ruído estatístico.
+
+**O robô foi ligado de verdade** com essa combinação (`Magnificent7-op` / `price_action`, stake 1.0, PRACTICE) — primeira entrada real: CALL, confiança 1.00, `WON`, profit +0.85.
+
+O usuário então pediu para evoluir a estratégia: "pullback com zonas fortes, retração a favor da tendência, volatilidade da vela". Investigado antes de escrever qualquer código: "retração a favor da tendência" já é a definição central do `Pullback` original (Sprint 5) — o que faltava eram os outros dois conceitos. Confirmado que os componentes já existem: `MarketSnapshot.supports`/`.resistances` (zonas de suporte/resistência com `Zone.strength = touches * (1 + recência)`, Market Engine Sprint 4) e `MarketSnapshot.volatility` (regime de volatilidade já derivado do ATR normalizado pelo próprio Market Engine — não precisou adicionar nenhum indicador novo).
+
+**Nova estratégia: `PullbackZones`** (`app/strategies/pullback_zones.py`, registrada como `pullback_zones`) — mesma estrutura do `Pullback` (regime/direção/estrutura compatíveis + retomada na direção da tendência), com duas trocas:
+1. **Zona forte em vez de EMA**: a correção precisa ter tocado uma zona de suporte (CALL) ou resistência (PUT) com `strength >= min_zone_strength`, não apenas se aproximado de uma média móvel.
+2. **Filtro de volatilidade**: rejeita quando `MarketSnapshot.volatility == LOW` (parâmetro `require_elevated_volatility`, default `True`) — evita disparar em mercado morto/lateral.
+
+15 testes novos (`tests/strategies/test_pullback_zones.py`): CALL/PUT disparando com zona forte tocada, zona fraca não conta, zona longe do preço não conta mesmo sendo forte, volatilidade baixa bloqueia (e não bloqueia quando desligado), regime incompatível falha a condição certa, dados insuficientes, sem dependência de indicador, validação de parâmetros, determinismo, e um smoke test contra o pipeline real do Market Engine (não só `MarketSnapshot` montada à mão). As `MarketSnapshot` de teste são construídas diretamente (não via `build_snapshot`), porque zonas e volatilidade dependem de detecção de swing/ATR real — difícil de engenheirar de forma confiável só a partir de uma série de preços; o smoke test cobre a integração real separadamente.
+
+Adicionar a 7ª estratégia quebrou 3 testes que hardcodavam "6 estratégias" (`test_registry.py`, `test_api_integration.py`, `test_service_integration.py` da Sprint 5) — corrigidos para 7, sem alterar o que cada um verifica.
+
 ---
 
 ## 9. Testes

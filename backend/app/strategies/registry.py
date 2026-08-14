@@ -4,11 +4,12 @@ from app.strategies.divergence import Divergence
 from app.strategies.mean_reversion import MeanReversion
 from app.strategies.price_action import PriceAction
 from app.strategies.pullback import Pullback
+from app.strategies.pullback_zones import PullbackZones
 from app.strategies.trend_following import TrendFollowing
 
 _STRATEGIES: dict[str, type[Strategy]] = {
     cls.name: cls
-    for cls in (TrendFollowing, Pullback, Breakout, MeanReversion, PriceAction, Divergence)
+    for cls in (TrendFollowing, Pullback, PullbackZones, Breakout, MeanReversion, PriceAction, Divergence)
 }
 
 

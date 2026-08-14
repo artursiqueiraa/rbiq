@@ -31,6 +31,7 @@ def test_evaluate_all_runs_every_strategy_over_the_same_snapshot(db_session):
     assert set(results.keys()) == {
         "trend_following",
         "pullback",
+        "pullback_zones",
         "breakout",
         "mean_reversion",
         "price_action",

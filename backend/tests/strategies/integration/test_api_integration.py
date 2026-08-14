@@ -28,7 +28,7 @@ def test_evaluate_endpoint_returns_a_signal(db_session):
     assert "market_direction_bullish" in body["triggered_conditions"]
 
 
-def test_evaluate_all_endpoint_returns_all_six(db_session):
+def test_evaluate_all_endpoint_returns_all_seven(db_session):
     candles = seed_candles(db_session, SYMBOL, STRONG_BULLISH_TREND)
 
     response = client.post(
@@ -41,6 +41,7 @@ def test_evaluate_all_endpoint_returns_all_six(db_session):
     assert set(body.keys()) == {
         "trend_following",
         "pullback",
+        "pullback_zones",
         "breakout",
         "mean_reversion",
         "price_action",
