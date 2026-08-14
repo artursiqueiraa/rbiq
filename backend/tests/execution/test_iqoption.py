@@ -530,3 +530,76 @@ def test_get_payout_times_out_instead_of_hanging_forever():
     gateway = _gateway_with(_HangingProfitClient(), refresh_actives_timeout_s=0.05)
     with pytest.raises(BrokerConnectionError, match="não respondeu"):
         gateway.get_payout("USDCAD-OTC")
+
+
+class _InitV2Client:
+    def __init__(self, data):
+        self.data = data
+
+    def get_all_init_v2(self):
+        return self.data
+
+
+def _mk_active(name, enabled=True, suspended=False, commission=18):
+    return {
+        "name": f"front.{name}",
+        "enabled": enabled,
+        "is_suspended": suspended,
+        "option": {"profit": {"commission": commission}},
+    }
+
+
+def test_list_open_symbols_filters_and_sorts_by_payout_desc():
+    data = {
+        "binary": {
+            "actives": {
+                "1": _mk_active("EURUSD-OTC", commission=20),  # payout 0.80
+                "2": _mk_active("USDCAD-OTC", commission=10),  # payout 0.90
+                "3": _mk_active("GBPUSD-OTC", enabled=False),  # desabilitado -> fora
+                "4": _mk_active("AUDCAD-OTC", suspended=True),  # suspenso -> fora
+            }
+        }
+    }
+    client = _InitV2Client(data)
+    gateway = _gateway_with(client)
+
+    symbols = gateway.list_open_symbols()
+
+    assert symbols == [("USDCAD-OTC", 0.90), ("EURUSD-OTC", 0.80)]
+
+
+def test_list_open_symbols_returns_empty_when_data_is_none():
+    client = _InitV2Client(None)
+    gateway = _gateway_with(client)
+    assert gateway.list_open_symbols() == []
+
+
+def test_list_open_symbols_skips_malformed_actives_without_failing():
+    data = {
+        "binary": {
+            "actives": {
+                "1": {"name": "front.BROKEN"},  # sem enabled/option -> ignorado
+                "2": _mk_active("EURUSD-OTC", commission=15),
+            }
+        }
+    }
+    client = _InitV2Client(data)
+    gateway = _gateway_with(client)
+    assert gateway.list_open_symbols() == [("EURUSD-OTC", 0.85)]
+
+
+def test_list_open_symbols_before_connect_raises():
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"))
+    with pytest.raises(BrokerConnectionError):
+        gateway.list_open_symbols()
+
+
+def test_list_open_symbols_times_out_instead_of_hanging_forever():
+    class _HangingInitV2Client:
+        def get_all_init_v2(self):
+            time.sleep(10.0)
+            return {}
+
+    gateway = _gateway_with(_HangingInitV2Client(), list_symbols_timeout_s=0.05)
+    with pytest.raises(BrokerConnectionError, match="não respondeu"):
+        gateway.list_open_symbols()

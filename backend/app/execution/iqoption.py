@@ -58,12 +58,14 @@ class IQOptionGateway(BrokerGateway):
         place_order_timeout_s: float = 15.0,
         check_win_call_timeout_s: float = 5.0,
         refresh_actives_timeout_s: float = 20.0,
+        list_symbols_timeout_s: float = 35.0,
     ) -> None:
         self._credentials = credentials
         self._practice_by_default = practice_by_default
         self._place_order_timeout_s = place_order_timeout_s
         self._check_win_call_timeout_s = check_win_call_timeout_s
         self._refresh_actives_timeout_s = refresh_actives_timeout_s
+        self._list_symbols_timeout_s = list_symbols_timeout_s
         self._client: Any = None
         self._connected_account_type: Optional[AccountType] = None
         # order_id -> instrument da ordem: `await_result` recebe só o
@@ -274,6 +276,47 @@ class IQOptionGateway(BrokerGateway):
         if payout is None:
             payout = per_symbol.get(fallback_key)
         return float(payout) if payout is not None else None
+
+    def list_open_symbols(self, instrument: InstrumentType = InstrumentType.BINARY) -> list[tuple[str, float]]:
+        """Símbolos REALMENTE abertos agora (`enabled` e não `is_suspended`),
+        com o payout de cada um, ordenados do maior para o menor payout —
+        para escolher entre eles em vez de digitar às cegas
+        (`scripts/screen_pairs.py`).
+
+        VERIFICAR: `get_all_init_v2()[categoria]["actives"][id]` — SEM
+        wrapper `"result"` (diferente de `get_all_init()`/`get_all_profit`,
+        que usam a v1 e têm `["result"][categoria]`) — confirmado na fork
+        instalada via chamada real, com `name`/`enabled`/`is_suspended`/
+        `option.profit.commission` (payout = (100 - commission) / 100) todos
+        presentes em cada active. `categoria` é `"binary"` ou `"turbo"`;
+        usamos `"binary"` para `InstrumentType.BINARY`. `get_all_init_v2` já
+        tem um timeout interno de 30s (devolve `None`, não trava) — ainda
+        assim protegida por `_call_with_timeout` com uma margem
+        (`list_symbols_timeout_s`, 35s).
+        """
+        self._require_connected()
+        data = self._call_with_timeout(self._list_symbols_timeout_s, self._client.get_all_init_v2)
+        if not data:
+            return []
+
+        category = "binary" if instrument is InstrumentType.BINARY else "turbo"
+        actives = data.get(category, {}).get("actives", {})
+
+        open_symbols: list[tuple[str, float]] = []
+        for active in actives.values():
+            try:
+                name = str(active["name"]).split(".")[-1]
+                enabled = active.get("enabled")
+                suspended = active.get("is_suspended")
+                commission = active["option"]["profit"]["commission"]
+            except (KeyError, TypeError):
+                continue
+            if not enabled or suspended:
+                continue
+            open_symbols.append((name, (100.0 - float(commission)) / 100.0))
+
+        open_symbols.sort(key=lambda item: item[1], reverse=True)
+        return open_symbols
 
     def place_order(self, request: OrderRequest) -> str:
         self._require_connected()

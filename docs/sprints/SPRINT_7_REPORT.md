@@ -2,7 +2,7 @@
 ## Live Execution Engine — IQO Strategy Lab
 
 **Data:** 2026-08-12
-**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 459 testes passando (356 das Sprints 1-6 + 92 do Live Execution Engine + 11 do novo `app/live`), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em quatro rodadas** (seções 8.2-8.5), com **êxito**: uma ordem BINARY real (`USDCAD-OTC`) foi enviada, resolvida (`WON`, profit 0.82) e refletida corretamente no saldo — através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez. Cinco bugs reais corrigidos ao longo da validação: hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`, dicionário de ativos operáveis nunca atualizado em `connect()` (causa raiz das recusas anteriores), e `check_win_v4` chamado com o tipo de chave errado (string em vez de int), fazendo o polling travar silenciosamente sem nunca resolver. Caminho `DIGITAL` continua sem confirmar (problema separado, não resolvido — ver seção 13); caminho `BINARY` está validado e funcional. Além do escopo original da spec: um loop de trading ao vivo (`app/live`, seção 8.6) foi construído sob pedido explícito do usuário e **rodado pela primeira vez por ele mesmo, contra a conta real** (seção 8.7) — conectou, leu saldo, e reagiu corretamente a uma recusa por janela de compra fechada (terceiro tipo de mensagem de recusa documentado nesta Sprint), sem travar nem levantar exceção.
+**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 464 testes passando (356 das Sprints 1-6 + 97 do Live Execution Engine + 11 do novo `app/live`), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em quatro rodadas** (seções 8.2-8.5), com **êxito**: uma ordem BINARY real (`USDCAD-OTC`) foi enviada, resolvida (`WON`, profit 0.82) e refletida corretamente no saldo — através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez. Cinco bugs reais corrigidos ao longo da validação: hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`, dicionário de ativos operáveis nunca atualizado em `connect()` (causa raiz das recusas anteriores), e `check_win_v4` chamado com o tipo de chave errado (string em vez de int), fazendo o polling travar silenciosamente sem nunca resolver. Caminho `DIGITAL` continua sem confirmar (problema separado, não resolvido — ver seção 13); caminho `BINARY` está validado e funcional. Além do escopo original da spec: um loop de trading ao vivo (`app/live`, seção 8.6) foi construído sob pedido explícito do usuário e **rodado pela primeira vez por ele mesmo, contra a conta real** (seção 8.7) — conectou, leu saldo, e reagiu corretamente a uma recusa por janela de compra fechada (terceiro tipo de mensagem de recusa documentado nesta Sprint), sem travar nem levantar exceção.
 
 ---
 
@@ -231,17 +231,27 @@ Duas coisas pedidas juntas depois de observar a sessão real: por que só saíam
 Depois da seção 8.9, ficou explícito ao usuário que `min_confidence`/`SessionStats` não são uma taxa de acerto medida ANTES de operar — só depois, e só daquela sessão. O usuário pediu essa medição prévia ("pode ser", em resposta à oferta de conectar o Backtest Engine a dados reais). Construído `scripts/backtest_live_pair.py`: puxa histórico real de um par via `IQOptionGateway.get_recent_candles` e roda o Backtest Engine (Sprint 6) contra ele — a mesma engine causal/determinística já auditada, não uma reimplementação.
 
 - **`IQOptionGateway.get_payout(symbol, instrument)`**: nova capacidade do gateway, devolve o payout REAL atual (`get_all_profit()` da lib) em vez do script adivinhar um valor fixo para `BacktestConfig.payout`. Achado real ao validar: essa chamada busca o catálogo inteiro de ativos (como `get_ALL_Binary_ACTIVES_OPCODE`), então precisa do timeout mais generoso (`_refresh_actives_timeout_s`, 20s) — usar o timeout curto de polling (`_check_win_call_timeout_s`, 5s) estourava na prática contra a conta real. Corrigido antes de documentar como concluído.
-- **`_InMemoryCandleRepository`**: satisfaz o Protocol `CandleRepository` do Backtest Engine com uma lista de candles já buscada (sem banco, sem repetir a chamada de rede por avaliação — o engine só chama `get_candles()` uma vez no início do run).
+- **`InMemoryCandleRepository`** (`scripts/_backtest_repo.py`, compartilhada com `screen_pairs.py` — seção 8.11): satisfaz o Protocol `CandleRepository` do Backtest Engine com uma lista de candles já buscada (sem banco, sem repetir a chamada de rede por avaliação — o engine só chama `get_candles()` uma vez no início do run).
 - **Limitação conhecida e documentada no script**: uma única chamada de `get_candles` devolve no máximo ~1000 candles (confirmado pedindo 1000 e 5000 — os dois devolveram exatamente 1000) — em M1, ~16-17h de histórico. Paginação com `endtime` decrescente para ir mais fundo não foi implementada.
 - **Validado ponta a ponta contra a conta real**: `pullback` em `USDCAD-OTC` sobre ~17h de candles reais → 525 trades, win_rate 52,98%, expectancy levemente negativa (-0.0356); `trend_following` no mesmo par sobre uma janela menor → 114 trades, win_rate 59,65%, expectancy positiva (0.0856). Números diferentes entre estratégias no MESMO par, exatamente o tipo de diferença que esta ferramenta existe para revelar antes de operar ao vivo.
 - **Achado real de robustez, batido durante a própria validação**: `summary_text()` (Sprint 6) imprime `→`, que quebra em console Windows cp1252 — já documentado como "não é bug do projeto" desde a Sprint 6, mas aqui o script crashava no ÚLTIMO print, depois de já ter gasto uma chamada de rede real. Corrigido com `safe_print()`: tenta `print()` normal, e só se estourar `UnicodeEncodeError` recodifica substituindo os caracteres não suportados por `?`, em vez de deixar o script morrer bem no resultado final. Validado que o fallback engata sem quebrar mesmo sem forçar `PYTHONIOENCODING=utf-8`.
 - **Disclaimer explícito no final da saída**: resultado é sobre uma janela curta e recente, não é afirmação de lucratividade nem previsão do que vai acontecer ao vivo — mesma disciplina já estabelecida nas Sprints 5 e 6.
 
+### 8.11. `scripts/screen_pairs.py` — varrer todas as paridades abertas, não digitar uma por uma
+
+O usuário pediu explicitamente para não ter que digitar paridades às cegas: "ele me trazer todas disponíveis... ou ele analisar todos as paridades e me trazer as melhores, e qual estratégia usar nessa paridade". Construído um screener que faz as duas coisas: lista os pares REALMENTE abertos agora e testa cada estratégia contra cada um.
+
+- **`IQOptionGateway.list_open_symbols(instrument)`**: nova capacidade — devolve `[(symbol, payout)]` dos pares `enabled` e não `is_suspended` agora, ordenados por payout decrescente. VERIFICAR resolvido por tentativa real: a primeira versão assumiu a mesma estrutura `["result"][categoria]["actives"]` de `get_all_profit()` (que usa `get_all_init()`, v1) — mas `get_all_init_v2()` (usado aqui) devolve `[categoria]["actives"]` DIRETO, sem o wrapper `"result"`. Descoberto inspecionando o payload real antes de escrever os testes, não adivinhando. Validado contra a conta: 226 pares abertos no momento do teste, com os MESMOS payouts vistos nos screenshots do usuário antes (USD/PHP 92%, EUR/USD 88%).
+- **`scripts/screen_pairs.py`**: busca os pares abertos, pergunta quantos dos top (por payout) varrer e quais estratégias testar (default: todas as 6), busca os candles de cada par UMA vez (reaproveitados entre todas as estratégias testadas nesse par — não refaz a chamada de rede por estratégia), roda um backtest real por combinação via `BacktestRunner`/`StrategyEvaluatorAdapter` (o mesmo motor de `backtest_live_pair.py`, não uma reimplementação), imprime progresso combinação a combinação (nunca uma tela em branco por minutos), e ao final ordena por `expectancy` um ranking das combinações com pelo menos N trades (filtro configurável contra amostras pequenas demais para significar algo). `Ctrl+C` a qualquer momento mostra o ranking parcial do que já rodou, em vez de perder tudo.
+- **Extraído `scripts/_cli_helpers.py`** (`ask`/`ask_float`/`ask_int`/`safe_print`) **e `scripts/_backtest_repo.py`** (`InMemoryCandleRepository`): depois do terceiro script real precisando dos mesmos helpers (`run_live_bot.py`, `backtest_live_pair.py`, `screen_pairs.py`), extrair passou a valer a pena — não antes. `backtest_live_pair.py` foi atualizado para importar dali em vez de manter sua própria cópia.
+- **Validado ponta a ponta contra a conta real**: 3 pares (`USDPHP-OTC`, `AXY`, `DXY`) x 2 estratégias (`pullback`, `trend_following`) → 6 backtests reais, resultados diferentes por combinação (win_rate entre 47,5% e 54,8%, expectancy variando de -0.107 a +0.040) — confirma que o ranking reflete diferenças reais entre combinações, não ruído.
+- **Custo de tempo, documentado no próprio script antes de rodar**: cada combinação é um backtest real (mesmo motor de ~2,3s/500 candles observado na Sprint 6) mais uma busca de candles por par — um escopo default de 15 pares x 6 estratégias pode levar vários minutos. O script avisa a estimativa antes de começar e imprime progresso, em vez de deixar o operador sem saber se travou.
+
 ---
 
 ## 9. Testes
 
-**103 testes** (92 em `tests/execution/` + 11 em `tests/live/`), todos com `PaperBroker` e dublês locais — nenhum toca rede (ver seções 8.1-8.6 sobre o cuidado extra necessário em `test_iqoption.py` ao longo das quatro rodadas de validação manual):
+**108 testes** (97 em `tests/execution/` + 11 em `tests/live/`), todos com `PaperBroker` e dublês locais — nenhum toca rede (ver seções 8.1-8.6 sobre o cuidado extra necessário em `test_iqoption.py` ao longo das quatro rodadas de validação manual):
 
 ```text
 tests/execution/test_types.py       9 testes   idempotência, normalização de direção, imutabilidade
@@ -250,9 +260,9 @@ tests/execution/test_guard.py       9 testes   kill switch, as 3 regras de risco
 tests/execution/test_paper.py      10 testes   WON/LOST/TIE semeados, saldo, recusas forçadas
 tests/execution/test_executor.py   11 testes   pipeline completo, nunca-levanta, idempotência, stake fixo
 tests/execution/test_isolation.py   3 testes   AST: backtest <-> execution nunca se importam
-tests/execution/test_iqoption.py   38 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
-                                                place_order/check_win/get_candles/get_payout, roteamento binário vs
-                                                digital, refresh de ativos no connect(), conversão para Candle canônico
+tests/execution/test_iqoption.py   43 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
+                                                place_order/check_win/get_candles/get_payout/list_open_symbols,
+                                                roteamento binário vs digital, refresh de ativos no connect()
 tests/live/test_loop.py             9 testes   causalidade (só reavalia em candle novo), execução quando sinaliza,
                                                 nunca reavalia o mesmo candle, run_forever sobrevive a exceções,
                                                 on_signal roda antes de on_record, com a evaluation completa
@@ -266,7 +276,7 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 ## 10. Regressão
 
 ```text
-459 testes passando (356 das Sprints 1-6 + 92 de execution + 11 de live), 0 falhas, contra PostgreSQL real.
+464 testes passando (356 das Sprints 1-6 + 97 de execution + 11 de live), 0 falhas, contra PostgreSQL real.
 ```
 
 ---

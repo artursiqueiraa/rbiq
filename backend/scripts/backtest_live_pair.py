@@ -24,66 +24,17 @@ from __future__ import annotations
 
 import getpass
 import sys
-from datetime import datetime
 
 sys.path.insert(0, ".")
 
 from app.backtest import BacktestConfig, BacktestRunner, StrategyEvaluatorAdapter, summary_text
-from app.data.types import Candle, Timeframe
+from app.data.types import Timeframe
 from app.execution.broker import BrokerConnectionError
 from app.execution.config import Credentials
 from app.execution.iqoption import IQOptionGateway, TwoFactorAuthRequired
 from app.strategies.registry import StrategyRegistry
-
-
-def safe_print(text: str = "") -> None:
-    """`print()` normal, mas nunca quebra num console Windows com codepage
-    cp1252 (achado real: `summary_text()` do Backtest Engine usa `→`, que
-    não existe em cp1252 — já documentado desde a Sprint 6). Em vez de
-    deixar o script morrer bem no resultado final, troca os caracteres que
-    o console não sabe exibir por `?` e segue."""
-    try:
-        print(text)
-    except UnicodeEncodeError:
-        encoding = sys.stdout.encoding or "ascii"
-        print(text.encode(encoding, errors="replace").decode(encoding))
-
-
-def ask(prompt: str, default: str | None = None) -> str:
-    suffix = f" [{default}]" if default is not None else ""
-    value = input(f"{prompt}{suffix}: ").strip()
-    return value or (default or "")
-
-
-def ask_float(prompt: str, default: float) -> float:
-    raw = ask(prompt, str(default))
-    try:
-        return float(raw)
-    except ValueError:
-        print(f"  valor inválido, usando {default}")
-        return default
-
-
-def ask_int(prompt: str, default: int) -> int:
-    raw = ask(prompt, str(default))
-    try:
-        return int(raw)
-    except ValueError:
-        print(f"  valor inválido, usando {default}")
-        return default
-
-
-class _InMemoryCandleRepository:
-    """Satisfaz o Protocol `CandleRepository` do Backtest Engine com uma
-    lista de candles já buscada uma vez — sem banco, sem repetir a chamada
-    de rede a cada avaliação (o engine chama get_candles() uma única vez no
-    início do run, não por candle)."""
-
-    def __init__(self, candles: list[Candle]) -> None:
-        self._candles = candles
-
-    def get_candles(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> list[Candle]:
-        return [c for c in self._candles if start <= c.timestamp <= end]
+from scripts._backtest_repo import InMemoryCandleRepository
+from scripts._cli_helpers import ask, ask_float, ask_int, safe_print
 
 
 def main() -> None:
@@ -144,7 +95,7 @@ def main() -> None:
     else:
         safe_print(f"Payout real de {symbol}: {payout:.0%}")
 
-    repository = _InMemoryCandleRepository(candles)
+    repository = InMemoryCandleRepository(candles)
     strategy = StrategyRegistry.create(strategy_name, min_confidence=min_confidence)
     strategy_service = StrategyEvaluatorAdapter(strategy, symbol, "M1")
 
