@@ -2,7 +2,7 @@
 ## Live Execution Engine — IQO Strategy Lab
 
 **Data:** 2026-08-12
-**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 454 testes passando (356 das Sprints 1-6 + 87 do Live Execution Engine + 11 do novo `app/live`), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em quatro rodadas** (seções 8.2-8.5), com **êxito**: uma ordem BINARY real (`USDCAD-OTC`) foi enviada, resolvida (`WON`, profit 0.82) e refletida corretamente no saldo — através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez. Cinco bugs reais corrigidos ao longo da validação: hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`, dicionário de ativos operáveis nunca atualizado em `connect()` (causa raiz das recusas anteriores), e `check_win_v4` chamado com o tipo de chave errado (string em vez de int), fazendo o polling travar silenciosamente sem nunca resolver. Caminho `DIGITAL` continua sem confirmar (problema separado, não resolvido — ver seção 13); caminho `BINARY` está validado e funcional. Além do escopo original da spec: um loop de trading ao vivo (`app/live`, seção 8.6) foi construído sob pedido explícito do usuário e **rodado pela primeira vez por ele mesmo, contra a conta real** (seção 8.7) — conectou, leu saldo, e reagiu corretamente a uma recusa por janela de compra fechada (terceiro tipo de mensagem de recusa documentado nesta Sprint), sem travar nem levantar exceção.
+**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 459 testes passando (356 das Sprints 1-6 + 92 do Live Execution Engine + 11 do novo `app/live`), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em quatro rodadas** (seções 8.2-8.5), com **êxito**: uma ordem BINARY real (`USDCAD-OTC`) foi enviada, resolvida (`WON`, profit 0.82) e refletida corretamente no saldo — através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez. Cinco bugs reais corrigidos ao longo da validação: hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`, dicionário de ativos operáveis nunca atualizado em `connect()` (causa raiz das recusas anteriores), e `check_win_v4` chamado com o tipo de chave errado (string em vez de int), fazendo o polling travar silenciosamente sem nunca resolver. Caminho `DIGITAL` continua sem confirmar (problema separado, não resolvido — ver seção 13); caminho `BINARY` está validado e funcional. Além do escopo original da spec: um loop de trading ao vivo (`app/live`, seção 8.6) foi construído sob pedido explícito do usuário e **rodado pela primeira vez por ele mesmo, contra a conta real** (seção 8.7) — conectou, leu saldo, e reagiu corretamente a uma recusa por janela de compra fechada (terceiro tipo de mensagem de recusa documentado nesta Sprint), sem travar nem levantar exceção.
 
 ---
 
@@ -226,11 +226,22 @@ Duas coisas pedidas juntas depois de observar a sessão real: por que só saíam
 
 **`scripts/run_live_bot.py` ganhou `SessionStats`**: contagem WON/LOST/TIE acumulada da sessão, com `win_rate = wins / (wins + losses)` — TIE fica de fora do denominador, a MESMA convenção já usada pelo Backtest Engine (Sprint 6, seção 36 do relatório: draws fora do denominador) — escolhida deliberadamente para manter as duas ferramentas comparáveis, em vez de inventar uma convenção nova. Impressa depois de cada ordem resolvida e num resumo final ao encerrar o loop (Ctrl+C).
 
+### 8.10. `scripts/backtest_live_pair.py` — medir antes de arriscar
+
+Depois da seção 8.9, ficou explícito ao usuário que `min_confidence`/`SessionStats` não são uma taxa de acerto medida ANTES de operar — só depois, e só daquela sessão. O usuário pediu essa medição prévia ("pode ser", em resposta à oferta de conectar o Backtest Engine a dados reais). Construído `scripts/backtest_live_pair.py`: puxa histórico real de um par via `IQOptionGateway.get_recent_candles` e roda o Backtest Engine (Sprint 6) contra ele — a mesma engine causal/determinística já auditada, não uma reimplementação.
+
+- **`IQOptionGateway.get_payout(symbol, instrument)`**: nova capacidade do gateway, devolve o payout REAL atual (`get_all_profit()` da lib) em vez do script adivinhar um valor fixo para `BacktestConfig.payout`. Achado real ao validar: essa chamada busca o catálogo inteiro de ativos (como `get_ALL_Binary_ACTIVES_OPCODE`), então precisa do timeout mais generoso (`_refresh_actives_timeout_s`, 20s) — usar o timeout curto de polling (`_check_win_call_timeout_s`, 5s) estourava na prática contra a conta real. Corrigido antes de documentar como concluído.
+- **`_InMemoryCandleRepository`**: satisfaz o Protocol `CandleRepository` do Backtest Engine com uma lista de candles já buscada (sem banco, sem repetir a chamada de rede por avaliação — o engine só chama `get_candles()` uma vez no início do run).
+- **Limitação conhecida e documentada no script**: uma única chamada de `get_candles` devolve no máximo ~1000 candles (confirmado pedindo 1000 e 5000 — os dois devolveram exatamente 1000) — em M1, ~16-17h de histórico. Paginação com `endtime` decrescente para ir mais fundo não foi implementada.
+- **Validado ponta a ponta contra a conta real**: `pullback` em `USDCAD-OTC` sobre ~17h de candles reais → 525 trades, win_rate 52,98%, expectancy levemente negativa (-0.0356); `trend_following` no mesmo par sobre uma janela menor → 114 trades, win_rate 59,65%, expectancy positiva (0.0856). Números diferentes entre estratégias no MESMO par, exatamente o tipo de diferença que esta ferramenta existe para revelar antes de operar ao vivo.
+- **Achado real de robustez, batido durante a própria validação**: `summary_text()` (Sprint 6) imprime `→`, que quebra em console Windows cp1252 — já documentado como "não é bug do projeto" desde a Sprint 6, mas aqui o script crashava no ÚLTIMO print, depois de já ter gasto uma chamada de rede real. Corrigido com `safe_print()`: tenta `print()` normal, e só se estourar `UnicodeEncodeError` recodifica substituindo os caracteres não suportados por `?`, em vez de deixar o script morrer bem no resultado final. Validado que o fallback engata sem quebrar mesmo sem forçar `PYTHONIOENCODING=utf-8`.
+- **Disclaimer explícito no final da saída**: resultado é sobre uma janela curta e recente, não é afirmação de lucratividade nem previsão do que vai acontecer ao vivo — mesma disciplina já estabelecida nas Sprints 5 e 6.
+
 ---
 
 ## 9. Testes
 
-**98 testes** (87 em `tests/execution/` + 11 em `tests/live/`), todos com `PaperBroker` e dublês locais — nenhum toca rede (ver seções 8.1-8.6 sobre o cuidado extra necessário em `test_iqoption.py` ao longo das quatro rodadas de validação manual):
+**103 testes** (92 em `tests/execution/` + 11 em `tests/live/`), todos com `PaperBroker` e dublês locais — nenhum toca rede (ver seções 8.1-8.6 sobre o cuidado extra necessário em `test_iqoption.py` ao longo das quatro rodadas de validação manual):
 
 ```text
 tests/execution/test_types.py       9 testes   idempotência, normalização de direção, imutabilidade
@@ -239,9 +250,9 @@ tests/execution/test_guard.py       9 testes   kill switch, as 3 regras de risco
 tests/execution/test_paper.py      10 testes   WON/LOST/TIE semeados, saldo, recusas forçadas
 tests/execution/test_executor.py   11 testes   pipeline completo, nunca-levanta, idempotência, stake fixo
 tests/execution/test_isolation.py   3 testes   AST: backtest <-> execution nunca se importam
-tests/execution/test_iqoption.py   33 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
-                                                place_order/check_win/get_candles, roteamento binário vs digital,
-                                                refresh de ativos no connect(), conversão para Candle canônico
+tests/execution/test_iqoption.py   38 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
+                                                place_order/check_win/get_candles/get_payout, roteamento binário vs
+                                                digital, refresh de ativos no connect(), conversão para Candle canônico
 tests/live/test_loop.py             9 testes   causalidade (só reavalia em candle novo), execução quando sinaliza,
                                                 nunca reavalia o mesmo candle, run_forever sobrevive a exceções,
                                                 on_signal roda antes de on_record, com a evaluation completa
@@ -255,7 +266,7 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 ## 10. Regressão
 
 ```text
-454 testes passando (356 das Sprints 1-6 + 87 de execution + 11 de live), 0 falhas, contra PostgreSQL real.
+459 testes passando (356 das Sprints 1-6 + 92 de execution + 11 de live), 0 falhas, contra PostgreSQL real.
 ```
 
 ---
@@ -286,10 +297,12 @@ Uma nova: `iqoptionapi` (`pyproject.toml`), resolvida via `[tool.uv.sources]` pa
 1. **Persistência/API/frontend**: assim como a Sprint 6, esta Sprint entrega só o engine + `InMemoryExecutionRepository`. Não há tabela `execution_records` no Postgres, endpoint de API, nem página de frontend — decisão consistente com o precedente já aberto na Sprint 6 (ver relatório anterior, seção 14), a ser resolvida junto com aquela pendência quando o usuário decidir.
 2. **Escala/concorrência**: o modelo é sequencial (uma ordem por vez, `max_concurrent_orders` por padrão limita a isso) — igual ao Backtest Engine. Múltiplas ordens simultâneas (relevante para operar vários símbolos em paralelo) é extensão futura, fora do escopo desta Sprint.
 3. **Instrumento `DIGITAL` continua sem confirmar** (seções 8.3-8.5): mesmo com o sufixo `-OTC` correto e as duas causas-raiz do binário já corrigidas, `buy_digital_spot`/`check_win_digital_v2`/`get_digital_underlying_list_data` nunca recebem resposta do servidor para este usuário. Não investigado a fundo depois que o caminho `BINARY` se mostrou funcional — não é urgente enquanto `BINARY` cobrir os pares que o usuário quer operar, mas seria necessário revisitar se ele precisar especificamente de opções digitais.
-4. **Loop de trading contínuo construído, mas não iniciado contra a conta real** (`app/live`, seção 8.6): `LiveTradingLoop` + `scripts/run_live_bot.py` estão prontos e testados hermeticamente com `PaperBroker`. Falta a etapa final — o usuário rodar `uv run python scripts/run_live_bot.py`, digitar credenciais/paridades/estratégia, e confirmar o início — que ainda não aconteceu nesta sessão. Esse componente inteiro (tipos novos, `app/live`, o CLI) não passou pelo mesmo nível de revisão/tempo de maturação que o resto da engine (que atravessou 4 rodadas de validação manual antes de ser considerada confiável) — vale tratar a primeira execução real como mais uma rodada de validação, não como "pronto para produção".
+4. **Loop de trading contínuo: construído E rodado pelo usuário contra a conta real** (seções 8.6/8.7) — pendência da versão anterior deste relatório, resolvida. Segue em uso ativo (seções 8.9/8.10 documentam ajustes pedidos depois de observar sessões reais).
+5. **`backtest_live_pair.py` limitado a ~1000 candles M1 por par** (seção 8.10, ~16-17h de histórico) — suficiente como filtro de sanidade rápido, mas não para uma amostra estatisticamente robusta. Paginar com `endtime` decrescente para juntar múltiplas chamadas e ir mais fundo no histórico é uma extensão natural, não implementada ainda.
+6. **Instrumento `DIGITAL` continua sem confirmar** (seções 8.3-8.5): mesmo com o sufixo `-OTC` correto e as duas causas-raiz do binário já corrigidas, `buy_digital_spot`/`check_win_digital_v2`/`get_digital_underlying_list_data` nunca recebem resposta do servidor para este usuário. Não é urgente enquanto `BINARY` cobrir os pares que o usuário quer operar.
 
 ---
 
 ## 14. Próxima Sprint
 
-O caminho de execução BINARY está validado ponta a ponta contra a conta real do usuário, e o loop de trading ao vivo (`app/live`) está construído e testado hermeticamente. Falta a etapa final: o usuário rodar `scripts/run_live_bot.py` de fato contra a conta real e confirmar que as entradas aparecem corretamente na plataforma. Nenhum trabalho adicional além disso será iniciado sem autorização explícita, conforme convenção do projeto.
+O caminho de execução BINARY está validado ponta a ponta e em uso ativo contra a conta real do usuário — conectando, operando, explicando cada entrada, e agora também com uma ferramenta de checagem prévia (`backtest_live_pair.py`) antes de comprometer stake numa combinação par/estratégia nova. Nenhum trabalho adicional além do que já foi pedido será iniciado sem autorização explícita, conforme convenção do projeto.

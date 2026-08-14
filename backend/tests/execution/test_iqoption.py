@@ -487,3 +487,46 @@ def test_get_recent_candles_times_out_instead_of_hanging_forever():
     gateway = _gateway_with(_HangingCandleClient(), check_win_call_timeout_s=0.05)
     with pytest.raises(BrokerConnectionError, match="não respondeu"):
         gateway.get_recent_candles("EURUSD-OTC", Timeframe.M1, 10)
+
+
+class _ProfitClient:
+    def __init__(self, all_profit):
+        self.all_profit = all_profit
+
+    def get_all_profit(self):
+        return self.all_profit
+
+
+def test_get_payout_returns_binary_payout_for_symbol():
+    client = _ProfitClient({"USDCAD-OTC": {"turbo": 0.85, "binary": 0.82}})
+    gateway = _gateway_with(client)
+    assert gateway.get_payout("USDCAD-OTC") == 0.82
+
+
+def test_get_payout_falls_back_to_turbo_when_binary_missing():
+    client = _ProfitClient({"USDCAD-OTC": {"turbo": 0.85}})
+    gateway = _gateway_with(client)
+    assert gateway.get_payout("USDCAD-OTC") == 0.85
+
+
+def test_get_payout_returns_none_for_unknown_symbol():
+    client = _ProfitClient({"USDCAD-OTC": {"turbo": 0.85, "binary": 0.82}})
+    gateway = _gateway_with(client)
+    assert gateway.get_payout("NAOEXISTE-OTC") is None
+
+
+def test_get_payout_before_connect_raises():
+    gateway = IQOptionGateway(Credentials(email="a@b.com", password="x"))
+    with pytest.raises(BrokerConnectionError):
+        gateway.get_payout("USDCAD-OTC")
+
+
+def test_get_payout_times_out_instead_of_hanging_forever():
+    class _HangingProfitClient:
+        def get_all_profit(self):
+            time.sleep(10.0)
+            return {}
+
+    gateway = _gateway_with(_HangingProfitClient(), refresh_actives_timeout_s=0.05)
+    with pytest.raises(BrokerConnectionError, match="não respondeu"):
+        gateway.get_payout("USDCAD-OTC")

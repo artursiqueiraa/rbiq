@@ -248,6 +248,33 @@ class IQOptionGateway(BrokerGateway):
         candles.sort(key=lambda c: c.timestamp)  # a lib não garante ordem
         return candles
 
+    def get_payout(self, symbol: str, instrument: InstrumentType = InstrumentType.BINARY) -> Optional[float]:
+        """Payout REAL atual do símbolo, direto da corretora — usado para
+        parametrizar `BacktestConfig.payout` corretamente (`scripts/
+        backtest_live_pair.py`) em vez de adivinhar um valor fixo. Devolve
+        `None` se o símbolo não for encontrado (não existe, ou fechado).
+
+        VERIFICAR: `get_all_profit()` devolve `{symbol: {"turbo": x, "binary":
+        y}}` (frações, ex.: 0.82 = 82%) — confirmado na fork instalada via
+        chamada real. Não tem timeout próprio — protegida por
+        `_call_with_timeout`. Usa `_refresh_actives_timeout_s` (não o
+        `_check_win_call_timeout_s`, mais curto): assim como
+        `get_ALL_Binary_ACTIVES_OPCODE`, `get_all_profit` busca o catálogo
+        INTEIRO de ativos — achado real: 5s (o timeout de polling) não é
+        suficiente, essa chamada legitimamente demora mais.
+        """
+        self._require_connected()
+        all_profit = self._call_with_timeout(self._refresh_actives_timeout_s, self._client.get_all_profit)
+        per_symbol = all_profit.get(symbol) if all_profit else None
+        if not per_symbol:
+            return None
+        primary_key = "binary" if instrument is InstrumentType.BINARY else "turbo"
+        fallback_key = "turbo" if instrument is InstrumentType.BINARY else "binary"
+        payout = per_symbol.get(primary_key)
+        if payout is None:
+            payout = per_symbol.get(fallback_key)
+        return float(payout) if payout is not None else None
+
     def place_order(self, request: OrderRequest) -> str:
         self._require_connected()
 
