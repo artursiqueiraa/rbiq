@@ -32,6 +32,7 @@ from app.indicators.registry import IndicatorRegistry, result_key
 from app.market.snapshot import build_snapshot
 from app.strategies.base import Strategy
 from app.strategies.context import StrategyContext
+from app.strategies.types import StrategyEvaluation
 
 
 class CandleSource(Protocol):
@@ -49,6 +50,7 @@ class LiveTradingLoop:
     poll_interval_s: float = 5.0
     on_record: Callable[[ExecutionRecord], None] = field(default=lambda record: None)
     on_error: Callable[[BaseException], None] = field(default=lambda exc: None)
+    on_signal: Callable[[StrategyEvaluation], None] = field(default=lambda evaluation: None)
 
     _last_evaluated_timestamp: Optional[object] = field(default=None, init=False, repr=False)
 
@@ -85,6 +87,12 @@ class LiveTradingLoop:
         evaluation = self.strategy.evaluate(context)
         if evaluation.signal is None:
             return None
+
+        # Disparado ANTES da execução, com a avaliação inteira (não só o
+        # Signal) — é aqui que o operador vê o "porquê" da entrada:
+        # confidence, strength, e quais condições técnicas bateram
+        # (evaluation.signal.conditions / triggered_conditions).
+        self.on_signal(evaluation)
 
         record = self.executor.execute(evaluation.signal, symbol=self.symbol)
         self.on_record(record)

@@ -2,7 +2,7 @@
 ## Live Execution Engine — IQO Strategy Lab
 
 **Data:** 2026-08-12
-**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 452 testes passando (356 das Sprints 1-6 + 87 do Live Execution Engine + 9 do novo `app/live`), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em quatro rodadas** (seções 8.2-8.5), com **êxito**: uma ordem BINARY real (`USDCAD-OTC`) foi enviada, resolvida (`WON`, profit 0.82) e refletida corretamente no saldo — através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez. Cinco bugs reais corrigidos ao longo da validação: hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`, dicionário de ativos operáveis nunca atualizado em `connect()` (causa raiz das recusas anteriores), e `check_win_v4` chamado com o tipo de chave errado (string em vez de int), fazendo o polling travar silenciosamente sem nunca resolver. Caminho `DIGITAL` continua sem confirmar (problema separado, não resolvido — ver seção 13); caminho `BINARY` está validado e funcional. Além do escopo original da spec: um loop de trading ao vivo (`app/live`, seção 8.6) foi construído sob pedido explícito do usuário e **rodado pela primeira vez por ele mesmo, contra a conta real** (seção 8.7) — conectou, leu saldo, e reagiu corretamente a uma recusa por janela de compra fechada (terceiro tipo de mensagem de recusa documentado nesta Sprint), sem travar nem levantar exceção.
+**Status:** Implementação completa (types → config → broker → paper → guard → repository → executor → testes → iqoption). 454 testes passando (356 das Sprints 1-6 + 87 do Live Execution Engine + 11 do novo `app/live`), zero regressão. Dependência `iqoptionapi` trocada para o fork mantido, pinada na tag mais recente (`7.1.1`, seção 8.4). Validação manual em conta DEMO **realizada em quatro rodadas** (seções 8.2-8.5), com **êxito**: uma ordem BINARY real (`USDCAD-OTC`) foi enviada, resolvida (`WON`, profit 0.82) e refletida corretamente no saldo — através do `IQOptionGateway` de produção, ponta a ponta, pela primeira vez. Cinco bugs reais corrigidos ao longo da validação: hang de `buy_digital_spot`/`check_win_digital_v2`, roteamento binário-vs-digital em `await_result`, dicionário de ativos operáveis nunca atualizado em `connect()` (causa raiz das recusas anteriores), e `check_win_v4` chamado com o tipo de chave errado (string em vez de int), fazendo o polling travar silenciosamente sem nunca resolver. Caminho `DIGITAL` continua sem confirmar (problema separado, não resolvido — ver seção 13); caminho `BINARY` está validado e funcional. Além do escopo original da spec: um loop de trading ao vivo (`app/live`, seção 8.6) foi construído sob pedido explícito do usuário e **rodado pela primeira vez por ele mesmo, contra a conta real** (seção 8.7) — conectou, leu saldo, e reagiu corretamente a uma recusa por janela de compra fechada (terceiro tipo de mensagem de recusa documentado nesta Sprint), sem travar nem levantar exceção.
 
 ---
 
@@ -216,11 +216,21 @@ Corrigido: o CLI agora pergunta "Confiança mínima para entrar" (default `0.75`
 
 Também vale registrar uma proteção que já existia sem ter sido comunicada antes: como todos os `LiveTradingLoop` de uma sessão compartilham o mesmo `ExecutionGuard` (`max_concurrent_orders=1` por padrão), só UMA ordem fica aberta por vez entre TODOS os pares operados — um sinal de um segundo par enquanto o primeiro ainda está pendente é rejeitado pela guarda (`LIMITE_DE_ORDENS_CONCORRENTES_ATINGIDO`), não enviado. Contribui para a sensação de "menos desgovernado" mesmo sem mexer em `min_confidence`.
 
+### 8.9. Explicação da entrada + taxa de acerto da sessão
+
+Duas coisas pedidas juntas depois de observar a sessão real: por que só saíam entradas CALL, e uma explicação de cada entrada com uma taxa de acerto acumulada.
+
+**Investigação do viés para CALL**: lida a estratégia `pullback` (`app/strategies/pullback.py`) e a função de decisão compartilhada por todas as 6 estratégias (`decide_direction`, `app/strategies/base.py`) — ambas perfeitamente simétricas entre alta e baixa (mesmo número de condições, mesmo peso, mesma regra de desempate). **Não há bug de viés no código.** A explicação mais provável é que o mercado, nos pares e no horário observados, estava mesmo predominantemente em regime de alta — exatamente o tipo de coisa que ficar visível por sinal (abaixo) permite o operador confirmar sozinho, em vez de precisar perguntar.
+
+**`LiveTradingLoop` ganhou um terceiro hook, `on_signal(evaluation: StrategyEvaluation)`**, disparado logo após a estratégia gerar um sinal e ANTES de chamar `LiveExecutor.execute()` — ordem verificada por teste (`test_run_once_calls_on_signal_before_on_record_with_the_full_evaluation`). Recebe a `StrategyEvaluation` inteira, não só o `Signal`, então o CLI tem acesso a `signal.direction`/`signal.confidence`/`signal.strength`/`signal.conditions` (as condições técnicas que bateram, nomeadas — ex.: `regime_compatible`, `market_direction_bullish`, `pullback_touched_ema`, `resumption_confirmed`) para imprimir o "porquê" de cada entrada, não só o resultado.
+
+**`scripts/run_live_bot.py` ganhou `SessionStats`**: contagem WON/LOST/TIE acumulada da sessão, com `win_rate = wins / (wins + losses)` — TIE fica de fora do denominador, a MESMA convenção já usada pelo Backtest Engine (Sprint 6, seção 36 do relatório: draws fora do denominador) — escolhida deliberadamente para manter as duas ferramentas comparáveis, em vez de inventar uma convenção nova. Impressa depois de cada ordem resolvida e num resumo final ao encerrar o loop (Ctrl+C).
+
 ---
 
 ## 9. Testes
 
-**96 testes** (87 em `tests/execution/` + 9 em `tests/live/`), todos com `PaperBroker` e dublês locais — nenhum toca rede (ver seções 8.1-8.6 sobre o cuidado extra necessário em `test_iqoption.py` ao longo das quatro rodadas de validação manual):
+**98 testes** (87 em `tests/execution/` + 11 em `tests/live/`), todos com `PaperBroker` e dublês locais — nenhum toca rede (ver seções 8.1-8.6 sobre o cuidado extra necessário em `test_iqoption.py` ao longo das quatro rodadas de validação manual):
 
 ```text
 tests/execution/test_types.py       9 testes   idempotência, normalização de direção, imutabilidade
@@ -232,8 +242,9 @@ tests/execution/test_isolation.py   3 testes   AST: backtest <-> execution nunca
 tests/execution/test_iqoption.py   33 testes   import tardio, as 3 travas, ImportError/2FA herméticos, timeout de
                                                 place_order/check_win/get_candles, roteamento binário vs digital,
                                                 refresh de ativos no connect(), conversão para Candle canônico
-tests/live/test_loop.py             7 testes   causalidade (só reavalia em candle novo), execução quando sinaliza,
-                                                nunca reavalia o mesmo candle, run_forever sobrevive a exceções
+tests/live/test_loop.py             9 testes   causalidade (só reavalia em candle novo), execução quando sinaliza,
+                                                nunca reavalia o mesmo candle, run_forever sobrevive a exceções,
+                                                on_signal roda antes de on_record, com a evaluation completa
 tests/live/test_isolation.py        2 testes   AST: app.live <-> app.backtest nunca se importam
 ```
 
@@ -244,7 +255,7 @@ Um teste em particular (`test_daily_counters_reset_on_new_day_but_open_orders_do
 ## 10. Regressão
 
 ```text
-452 testes passando (356 das Sprints 1-6 + 87 de execution + 9 de live), 0 falhas, contra PostgreSQL real.
+454 testes passando (356 das Sprints 1-6 + 87 de execution + 11 de live), 0 falhas, contra PostgreSQL real.
 ```
 
 ---

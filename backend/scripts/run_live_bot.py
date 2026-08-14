@@ -73,15 +73,67 @@ def ask_int(prompt: str, default: int) -> int:
         return default
 
 
-def print_record(symbol: str, record) -> None:
+class SessionStats:
+    """Contagem WON/LOST/TIE acumulada da sessão. `win_rate = wins /
+    (wins + losses)` — TIE fica FORA do denominador, mesma convenção já
+    usada pelo Backtest Engine (Sprint 6, seção 36 do relatório) — sem
+    isso, um TIE contaria como "quase perda" e distorceria a taxa."""
+
+    def __init__(self) -> None:
+        self.won = 0
+        self.lost = 0
+        self.tie = 0
+
+    def record(self, status: ExecutionStatus) -> None:
+        if status is ExecutionStatus.WON:
+            self.won += 1
+        elif status is ExecutionStatus.LOST:
+            self.lost += 1
+        elif status is ExecutionStatus.TIE:
+            self.tie += 1
+
+    @property
+    def resolved(self) -> int:
+        return self.won + self.lost + self.tie
+
+    @property
+    def win_rate(self) -> float | None:
+        denom = self.won + self.lost
+        return (self.won / denom) if denom else None
+
+    def summary(self) -> str:
+        rate = self.win_rate
+        rate_text = f"{rate:.1%}" if rate is not None else "—"
+        return f"{rate_text} de acerto ({self.won}W {self.lost}L {self.tie}T, {self.resolved} resolvidas)"
+
+
+def print_signal(symbol: str, evaluation) -> None:
+    # Disparado ANTES da execução — o "porquê" da entrada, não só o
+    # resultado. IMPORTANTE (repetido aqui de propósito): confidence é uma
+    # pontuação baseada em regras (proporção de condições técnicas que
+    # bateram), não uma taxa de acerto histórica medida.
+    signal = evaluation.signal
+    conditions = ", ".join(signal.conditions) if signal.conditions else "(nenhuma condição nomeada)"
+    print(
+        f"[sinal] {symbol}: {signal.direction.value} | confiança={signal.confidence:.2f} "
+        f"({signal.strength.value}) | condições satisfeitas: {conditions}"
+    )
+
+
+def print_record(symbol: str, record, stats: SessionStats) -> None:
     ts = record.resolved_at.strftime("%H:%M:%S") if record.resolved_at else "--:--:--"
     if record.status is ExecutionStatus.REJECTED:
         print(f"[{ts}] {symbol}: REJEITADO — {record.reject_reason}")
-    elif record.status is ExecutionStatus.ERROR:
+        return
+    if record.status is ExecutionStatus.ERROR:
         print(f"[{ts}] {symbol}: ERRO — {record.error}")
-    else:
-        direction = record.request.direction.value if record.request else "?"
-        print(f"[{ts}] {symbol}: {direction} -> {record.status.value} (profit={record.profit})")
+        return
+
+    direction = record.request.direction.value if record.request else "?"
+    print(f"[{ts}] {symbol}: {direction} -> {record.status.value} (profit={record.profit})")
+    stats.record(record.status)
+    if record.status in (ExecutionStatus.WON, ExecutionStatus.LOST, ExecutionStatus.TIE):
+        print(f"         taxa de acerto da sessão: {stats.summary()}")
 
 
 def main() -> None:
@@ -148,6 +200,7 @@ def main() -> None:
     guard = ExecutionGuard(config)
     repository = InMemoryExecutionRepository()
     executor = LiveExecutor(broker=gateway, guard=guard, repository=repository, config=config)
+    stats = SessionStats()
 
     loops = [
         LiveTradingLoop(
@@ -157,7 +210,8 @@ def main() -> None:
             symbol=symbol,
             timeframe=Timeframe.M1,
             poll_interval_s=poll_interval_s,
-            on_record=lambda record, sym=symbol: print_record(sym, record),
+            on_signal=lambda evaluation, sym=symbol: print_signal(sym, evaluation),
+            on_record=lambda record, sym=symbol: print_record(sym, record, stats),
             on_error=lambda exc, sym=symbol: print(f"[erro] {sym}: {exc}"),
         )
         for symbol in symbols
@@ -183,6 +237,7 @@ def main() -> None:
         stop_event.wait(poll_interval_s)
 
     print(f"\nParado. {len(repository.list_all())} ordens registradas nesta sessão.")
+    print(f"Taxa de acerto final: {stats.summary()}")
     print(f"Saldo final: {gateway.get_balance():.2f}")
 
 

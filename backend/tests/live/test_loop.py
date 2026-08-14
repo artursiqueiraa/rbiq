@@ -148,6 +148,52 @@ def test_run_once_executes_when_strategy_signals_and_calls_on_record():
     assert len(repository.list_all()) == 1
 
 
+def test_run_once_calls_on_signal_before_on_record_with_the_full_evaluation():
+    candles = make_candles([1, 2, 3, 4, 5])
+    signal = mk_signal(timestamp=candles[-1].timestamp)
+    strategy = _FakeStrategy(signals=[signal])
+    executor, *_ = mk_executor()
+
+    order: list[str] = []
+    seen_evaluations = []
+    loop = LiveTradingLoop(
+        candle_source=_FakeCandleSource([candles]),
+        executor=executor,
+        strategy=strategy,
+        symbol="TEST",
+        on_signal=lambda evaluation: (order.append("signal"), seen_evaluations.append(evaluation)),
+        on_record=lambda record: order.append("record"),
+    )
+
+    loop.run_once()
+
+    assert order == ["signal", "record"]  # avaliação explicada ANTES da execução
+    assert len(seen_evaluations) == 1
+    assert seen_evaluations[0].signal is signal
+
+    loop.run_once()  # mesmo candle: nada novo, nenhuma chamada extra
+    assert order == ["signal", "record"]
+
+
+def test_run_once_does_not_call_on_signal_when_strategy_does_not_signal():
+    candles = make_candles([1, 2, 3, 4, 5])
+    strategy = _FakeStrategy(signals=[None])
+    executor, *_ = mk_executor()
+
+    seen = []
+    loop = LiveTradingLoop(
+        candle_source=_FakeCandleSource([candles]),
+        executor=executor,
+        strategy=strategy,
+        symbol="TEST",
+        on_signal=seen.append,
+    )
+
+    loop.run_once()
+
+    assert seen == []
+
+
 def test_run_once_advances_when_a_genuinely_new_candle_arrives():
     first_batch = make_candles([1, 2, 3, 4, 5])
     second_batch = make_candles([1, 2, 3, 4, 5, 6])  # um candle a mais
