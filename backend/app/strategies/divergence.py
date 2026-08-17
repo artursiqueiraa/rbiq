@@ -30,16 +30,32 @@ class Divergence(Strategy):
         require_confirmation_candle (bool): if True, also require the current
             close to already be past the divergence swing's close (price has
             started moving). Default True.
+        rsi_oversold (0-100): RSI must have been at or below this at the
+            OLDER swing low for a bullish divergence to count. Default 35.
+        rsi_overbought (0-100): RSI must have been at or above this at the
+            OLDER swing high for a bearish divergence to count. Default 65.
 
     CALL requires (scored equally):
         - regime_compatible
-        - enough_swings:        at least 2 confirmed swing lows exist
-        - price_lower_low:      the more recent low < the older low
-        - rsi_higher_low:       RSI at the more recent low > RSI at the older low
-        - divergence_recent:    the more recent low is within max_bars_between_swings
-        - confirmation_candle:  current close > close at the more recent low
+        - enough_swings:          at least 2 confirmed swing lows exist
+        - price_lower_low:        the more recent low < the older low
+        - rsi_higher_low:         RSI at the more recent low > RSI at the older low
+        - rsi_oversold_at_swing:  RSI at the OLDER low was actually <= rsi_oversold
+            — without this, "RSI higher low" alone accepts a divergence
+            between two mediocre RSI readings nowhere near oversold (e.g.
+            45 -> 47), which isn't the stretched-momentum setup divergence
+            trading is supposed to catch. Real-data screening (measured via
+            screen_pairs.py against live candles) showed `divergence` firing
+            far more often than every other strategy — 500+ trades per pair
+            — while sitting at or below 50% win rate on most real FX pairs;
+            this was the one condition every other strategy in this file
+            already has some form of (a "was this actually meaningful"
+            check) that divergence was missing entirely.
+        - divergence_recent:      the more recent low is within max_bars_between_swings
+        - confirmation_candle:    current close > close at the more recent low
             (only checked when require_confirmation_candle is True)
-    PUT is the exact mirror image (swing highs, Higher High + Lower High in RSI).
+    PUT is the exact mirror image (swing highs, Higher High + Lower High in
+    RSI, rsi_overbought_at_swing instead of rsi_oversold_at_swing).
     """
 
     name = "divergence"
@@ -53,6 +69,8 @@ class Divergence(Strategy):
             "right_bars": 2,
             "max_bars_between_swings": 30,
             "require_confirmation_candle": True,
+            "rsi_oversold": 35.0,
+            "rsi_overbought": 65.0,
         }
 
     def validate_parameters(self, parameters: dict) -> None:
@@ -63,6 +81,8 @@ class Divergence(Strategy):
             raise ValueError("left_bars and right_bars must be >= 0")
         if parameters["max_bars_between_swings"] <= 0:
             raise ValueError("max_bars_between_swings must be > 0")
+        if not 0.0 <= parameters["rsi_oversold"] < parameters["rsi_overbought"] <= 100.0:
+            raise ValueError("rsi_oversold must be < rsi_overbought, both within [0, 100]")
 
     def required_indicators(self) -> list[IndicatorRequest]:
         return [IndicatorRequest("RSI", {"period": self.parameters["rsi_period"]})]
@@ -105,18 +125,22 @@ class Divergence(Strategy):
     def _direction_checks(self, context, swings, rsi_series, current_close, last_index, *, price_lower: bool):
         regime = self._regime_check(context)
         enough = len(swings) >= 2
+        extreme_label = "rsi_oversold_at_swing" if price_lower else "rsi_overbought_at_swing"
 
         if not enough:
             label = "price_lower_low" if price_lower else "price_higher_high"
             rsi_label = "rsi_higher_low" if price_lower else "rsi_lower_high"
-            return [
+            checks = [
                 regime,
                 ConditionCheck("enough_swings", False),
                 ConditionCheck(label, False),
                 ConditionCheck(rsi_label, False),
+                ConditionCheck(extreme_label, False),
                 ConditionCheck("divergence_recent", False),
-                ConditionCheck("confirmation_candle", False),
             ]
+            if self.parameters["require_confirmation_candle"]:
+                checks.append(ConditionCheck("confirmation_candle", False))
+            return checks
 
         older, newer = swings[-2], swings[-1]
         rsi_older = value_at(rsi_series, older.index)
@@ -126,11 +150,13 @@ class Divergence(Strategy):
             price_condition = ConditionCheck("price_lower_low", newer.price < older.price)
             rsi_ok = rsi_older is not None and rsi_newer is not None and rsi_newer > rsi_older
             rsi_condition = ConditionCheck("rsi_higher_low", rsi_ok)
+            extreme_ok = rsi_older is not None and rsi_older <= self.parameters["rsi_oversold"]
             confirmation_ok = current_close > float(newer.price)
         else:
             price_condition = ConditionCheck("price_higher_high", newer.price > older.price)
             rsi_ok = rsi_older is not None and rsi_newer is not None and rsi_newer < rsi_older
             rsi_condition = ConditionCheck("rsi_lower_high", rsi_ok)
+            extreme_ok = rsi_older is not None and rsi_older >= self.parameters["rsi_overbought"]
             confirmation_ok = current_close < float(newer.price)
 
         recent = (last_index - newer.index) <= self.parameters["max_bars_between_swings"]
@@ -140,6 +166,7 @@ class Divergence(Strategy):
             ConditionCheck("enough_swings", True),
             price_condition,
             rsi_condition,
+            ConditionCheck(extreme_label, extreme_ok),
             ConditionCheck("divergence_recent", recent),
         ]
         if self.parameters["require_confirmation_candle"]:
